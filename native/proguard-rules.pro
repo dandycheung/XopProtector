@@ -9,3 +9,6 @@
 -keep class com.yqsh.protector.shell.DexMerger { *; }
 -keep class com.yqsh.protector.shell.ApplicationReplacer { *; }
 -keep class com.yqsh.protector.shell.StrEnc { *; }
+# CrashGuard + nested handler (shell DEX re-d8; no lambda synthetics).
+-keep class com.yqsh.protector.shell.CrashGuard { *; }
+-keep class com.yqsh.protector.shell.CrashGuard$* { *; }

@@ -5,8 +5,8 @@ public final class Pvm2Opcodes {
     private Pvm2Opcodes() {
     }
 
-    /** Phase 5: float/double ALU + monitor + conversions (morph OP_COUNT=50). */
-    public static final int VERSION = 4;
+    /** Phase 5 ISA + PR11 imm XOR morph (v5). */
+    public static final int VERSION = 5;
 
     public static final int RET_V = 0;
     public static final int RET_I = 1;

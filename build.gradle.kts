@@ -193,7 +193,9 @@ tasks.register("protectDemo") {
                 "--hollow-prefix", "Lcom/yqsh/protectordemo/Business;",
                 "--true-vmp-prefix", "Lcom/yqsh/protectordemo/Business;",
                 "--protect-so",
-                // Assets encrypt / res-protect / NetGuard temporarily off (code kept; demo no longer requires them).
+                // Extra protect off for demo/desktop: assets / res-protect / NetGuard / pin-certs.
+                // CLI-only if needed. --encrypt-assets requires the app to read via ProtectorAssets
+                // (no transparent AssetManager hook; third-party AssetManager.open will fail).
                 "--no-encrypt-assets",
                 "--no-res-protect",
                 "--keystore", debugKs.absolutePath,
@@ -307,6 +309,7 @@ tasks.register("protectUnimpDemo") {
                 "--protect-so-mode", "safe",
                 "--payment-auto-vmp",
                 "--no-industry-auto-vmp",
+                // Same as protectDemo: assets/res/NetGuard off (CLI to enable; Assets needs ProtectorAssets).
                 "--no-encrypt-assets",
                 "--no-res-protect",
                 "--keystore", debugKs.absolutePath,

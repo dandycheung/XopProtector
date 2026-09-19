@@ -54,7 +54,7 @@ public final class ProtectOptions {
      * Runtime SO decrypt timing (written to {@code config.json}).
      * {@link #EAGER} — full materialize + preload at cold start (default, compatible).
      * {@link #LAZY} — on-demand materialize + preload existing {@code so_plain};
-     *               background fill writes {@code so_plain_ready} for warm reuse.
+     *               background fill this process (no {@code so_plain_ready} warm reuse).
      * CLI: {@code --so-decrypt-mode eager|lazy}.
      */
     public enum SoDecryptMode {
@@ -119,19 +119,21 @@ public final class ProtectOptions {
     /**
      * Phase 2B — shorten {@code res/} file paths + rewrite {@code resources.arsc}
      * string pool (AndResGuard-style). Default off. CLI: {@code --enable-res-protect}.
-     * Does not encrypt arsc (must stay STORED).
+     * Does not encrypt arsc (must stay STORED). Desktop UI hidden; use packer CLI.
      */
     public boolean enableResProtect;
 
     /**
      * Phase 2A — encrypt {@code assets/**} (excl. {@code assets/protector/**}).
      * Default off. CLI: {@code --encrypt-assets}.
+     * App must use {@code ProtectorAssets} (no AssetManager hook). Desktop UI hidden.
      */
     public boolean encryptAssets;
 
     /**
      * Phase 3 — proxy/VPN detect + optional cert pin list.
      * CLI: {@code --detect-proxy} / {@code --pin-certs <file>}.
+     * Desktop UI currently hidden; use packer CLI to enable.
      */
     public boolean detectProxy;
 

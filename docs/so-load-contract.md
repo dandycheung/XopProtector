@@ -8,10 +8,31 @@ Commercial runtime contract for encrypted business SOs. Strategies are
 | Id | Name | When | Linker `filename` / `dladdr` | File content |
 |----|------|------|------------------------------|--------------|
 | **L1** | Extract plain | Packaged extract dir is writable; plaintext published there after archiving cipher to `so_cipher/` | `/data/app/.../lib/<abi>/libX.so` | Same path (plaintext) |
-| **L2** | Extract name + FD | Extract not writable; plaintext mirror in `so_plain` | Extract path string (linker id) | `android_dlopen_ext` + `ANDROID_DLEXT_USE_LIBRARY_FD` → `so_plain` fd |
-| **L2b** | `dladdr` rewrite | After L2/L3 maps still show `so_plain` inode | Hooked `dladdr` returns extract path for keyed SOs | Unchanged |
-| **L3** | so_plain path | Fallback | `.../code_cache/protector/so_plain/libX.so` | Same |
+| **L2** | Extract name + FD | Extract not writable; plaintext from `so_plain` (or memfd copy) | Extract path string (linker id) | `android_dlopen_ext` + `ANDROID_DLEXT_USE_LIBRARY_FD` → **memfd** when `memfd_create` works and the SO is ≤ 16 MiB; else `so_plain` fd |
+| **L2b** | `dladdr` rewrite | After L2/L3 maps still show `so_plain` or `/memfd:` | Hooked `dladdr` returns extract path for keyed SOs | Unchanged |
+| **L3** | so_plain path | Fallback when memfd / `android_dlopen_ext` fail | `.../code_cache/protector/so_plain/libX.so` | Same |
 | **Skip** | Do not encrypt | Class S / path-sensitive / industry (mode-dependent) | N/A | — |
+
+After a successful **L1** or **L2** map, the keyed `so_plain/libX.so` file is
+**kept on disk** so the next process can warm-reuse via `so_plain_ready`
+(product chose cross-launch speed over in-process unlink). **L3** also keeps
+the file. Class S is never planted in `so_plain/`.
+
+## Plaintext warm cache (`so_plain_ready` + DEX `.prepatched`)
+
+Cross-launch speed by reusing decrypted mirrors (accepts plaintext-at-rest):
+
+| Path | Role |
+|------|------|
+| `code_cache/protector/so_plain/*` | Decrypted keyed ELF mirrors kept across launches |
+| `so_plain/so_plain_ready` | Present when all on-ABI keyed SOs are mirrored |
+| `.prepatched` + `classes*.dex` | DEX warm — skip PDX1 re-extract / re-prepatch |
+
+Cold start: RC4 into `so_plain` → write `so_plain_ready` (+ DEX `.prepatched`).  
+Next launch: reuse mirrors / prepatched dexes (skip RC4 and dex re-decrypt).  
+APK update deletes `so_plain/`, `.prepatched`, and extracted dexes via `invalidateIfApkChanged`.
+
+Legacy `so_warm/` PSW1 helpers may remain in the tree but are not used on this path.
 
 ### Hi-MC / HiBoat verification (2026-08)
 

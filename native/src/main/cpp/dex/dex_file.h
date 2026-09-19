@@ -85,7 +85,9 @@ struct DexView {
     bool valid = false;
 };
 
-/** Probe DexFile pointer by API level + magic/location checks. */
+/** Probe DexFile by API layout. Uses process_vm_readv so OEM/API 36 mismatch
+ *  does not SIGSEGV on std::string copy. Prefers sdk-matched layout; only
+ *  falls back on kInvalidLayout (never on kUnsafe). */
 DexView probe_dex_file(const void* dex_file, int sdk_level);
 
 /**
@@ -98,6 +100,13 @@ size_t read_methods(const uint8_t* data, size_t max_len, ClassDataMethod* out,
                     uint64_t count, bool* ok);
 
 int parse_dex_number(const std::string& location);
+
+/**
+ * Integrity v2: every {@code code.bin} (dex, method_idx) must exist as a
+ * concrete method ({@code code_off != 0}) in the matching extracted
+ * {@code classes*.dex} under {@code protector_dir}. Empty code.bin is OK.
+ */
+bool verify_code_methods_in_extracted_dexes(const char* protector_dir);
 
 /** Patch all methods of a class (idempotent).
  *  P0: decrypts off the mprotect path, then one RW window per class;

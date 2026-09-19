@@ -13,7 +13,7 @@ namespace protector::crypto {
 /**
  * Decrypt one code.bin method payload (nonce||ct||tag) into plain Dalvik bytes.
  * If flags&VMP (PVM1), GCM plaintext is a PVM1 image and is unpacked after GCM.
- * TRUE_VMP payloads are handled by prepare_true_vmp_images(), not here.
+ * TRUE_VMP payloads are decrypted on interpret (LRU), not here.
  */
 inline bool decrypt_insns(const uint8_t* enc, size_t enc_len,
                           uint8_t* plain, size_t plain_len,

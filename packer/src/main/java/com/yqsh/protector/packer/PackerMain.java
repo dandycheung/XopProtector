@@ -1,6 +1,5 @@
 package com.yqsh.protector.packer;
 
-import com.android.apksig.ApkVerifier;
 import com.android.apksigner.ApkSignerTool;
 import com.iyxan23.zipalignjava.ZipAlign;
 import com.wind.meditor.core.FileProcesser;
@@ -28,7 +27,6 @@ import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.Certificate;
-import java.security.cert.X509Certificate;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.util.ArrayList;
@@ -44,6 +42,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -117,11 +116,9 @@ public class PackerMain {
     private ProtectOptions.SoDecryptMode soDecryptMode = ProtectOptions.SoDecryptMode.EAGER;
     /** Per-APK PVM2 opcode morph (Phase 3); set in protect(). */
     private Pvm2Morph pvm2Morph;
-    /** Phase 0: unsupported Dalvik opcodes seen during TRUE_VMP compile skips. */
-    private final Map<Integer, Integer> trueVmpUnsupportedOpcodes = new LinkedHashMap<>();
-    private int trueVmpCompiled;
-    private int trueVmpSkipped;
-    /** Per-APK HMAC key for config.json (written into libprotector.so). */
+    /** True-VMP compile telemetry (PR6). Does not change admission. */
+    private final Pvm2Admission pvm2Admission = new Pvm2Admission();
+    /** Per-APK HMAC key for config.json (HKDF {@code K_hmac}; not written into SO). */
     private byte[] hmacKey;
     /** Phase 6: single channel stamped onto signed output. */
     private String channel;
@@ -333,7 +330,7 @@ public class PackerMain {
         System.err.println("  channel …        stamp/read signing-block channel (see: channel help)");
         System.err.println("  --profile          hollow / VMP intensity (default balanced)");
         System.err.println("                     balanced/perf=encrypt DEX; auto True-VMP on");
-        System.err.println("                     alipay|/wxapi/ only (no package hollow)");
+        System.err.println("                     /wxapi/ + all Alipay types (pay hot-path denylist empty)");
         System.err.println("                     industry=same + IndustryVmpRules default on;");
         System.err.println("                     SO budget defaults 48/24 MB unless overridden");
         System.err.println("                     aggressive=all non-SDK business types hollow");
@@ -350,6 +347,7 @@ public class PackerMain {
         System.err.println("  --protect-so       RC4 .text of business SOs (default ON)");
         System.err.println("  --no-protect-so    disable business SO .text encryption");
         System.err.println("  --encrypt-assets   AES-GCM encrypt assets/** → protector/aenc (default OFF)");
+        System.err.println("                     App must use ProtectorAssets (no AssetManager hook)");
         System.err.println("  --no-encrypt-assets disable assets encryption");
         System.err.println("  --enable-res-protect shorten res/ paths + rewrite resources.arsc (default OFF)");
         System.err.println("  --no-res-protect   disable res path obfuscation");
@@ -367,7 +365,7 @@ public class PackerMain {
         System.err.println("  --protect-so-exclude  comma-separated basenames to never encrypt");
         System.err.println("                     (e.g. libd3.so,libzhd3d.so); repeatable");
         System.err.println("  --so-decrypt-mode  eager (default)=full materialize+preload at cold start;");
-        System.err.println("                     lazy=on-demand + background fill (so_plain_ready warm reuse)");
+        System.err.println("                     lazy=on-demand + background fill (this process only)");
         System.err.println("                     Prefer loadLibrary after Application attach.");
         System.err.println("  --risk-flags      bitmask (default 48 = disable Root+Emulator)");
         System.err.println("  --rasp-action     0=alert 1=degrade 2=block (default 2)");
@@ -631,6 +629,9 @@ public class PackerMain {
             String packageName = ManifestHelperLocal.getPackageName(
                     new File(unpack, "AndroidManifest.xml"));
             System.out.println("Package: " + packageName);
+            if (packageName == null || packageName.isEmpty()) {
+                throw new IllegalStateException("Manifest package name required for key derivation");
+            }
             // Rebuild policy with applicationId so balanced/perf scope is package-local.
             protectPolicy = new ProtectPolicy(protectPolicy.profile(), hollowPrefixes, packageName);
             System.out.println("Hollow policy: " + protectPolicy.describe());
@@ -655,18 +656,28 @@ public class PackerMain {
             }
 
             int xorKey = 0; // legacy field retained in config.json
-            byte[] aesKey = new byte[16];
-            new SecureRandom().nextBytes(aesKey);
-            byte[] dexAesKey = new byte[16];
-            new SecureRandom().nextBytes(dexAesKey);
-            hmacKey = new byte[32];
-            new SecureRandom().nextBytes(hmacKey);
+            String appSignSha256 = resolveAppSignSha256(inputApk, signConfig);
+            if (appSignSha256 == null || appSignSha256.isEmpty()) {
+                throw new IllegalStateException(
+                        "Failed to resolve app_sign_sha256. Provide --cert-sha256 <hex>, "
+                                + "or --keystore (uses that cert), or a signed input APK.");
+            }
+            byte[] kMaster = new byte[KeyLadder.MASTER_LEN];
+            new SecureRandom().nextBytes(kMaster);
+            byte[] kWrap = new byte[KeyLadder.WRAP_LEN];
+            new SecureRandom().nextBytes(kWrap);
+            KeyLadder.Derived derived = KeyLadder.derive(
+                    kMaster, KeyLadder.fromHex(appSignSha256), packageName);
+            byte[] aesKey = derived.insn;
+            byte[] dexAesKey = derived.dex;
+            byte[] soAesKey = derived.so;
+            hmacKey = derived.hmac;
+            byte[] assetsAesKey = derived.assets;
             pvm2Morph = Pvm2Morph.random(new SecureRandom());
-            trueVmpCompiled = 0;
-            trueVmpSkipped = 0;
-            trueVmpUnsupportedOpcodes.clear();
+            pvm2Admission.reset();
             System.out.println("PVM2 morph isa_id=" + pvm2Morph.isaId
-                    + " op_count=" + Pvm2Morph.OP_COUNT);
+                    + " op_count=" + Pvm2Morph.OP_COUNT
+                    + " imm_xor=on");
 
             File assetsProtector = new File(unpack, "assets/protector");
             assetsProtector.mkdirs();
@@ -697,12 +708,9 @@ public class PackerMain {
                 System.out.println("Auto True-VMP (IndustryVmpRules): types=" + autoIndustryTypes
                         + " methods=" + autoIndustryMethods);
             }
-            System.out.println("TRUE_VMP summary: compiled=" + trueVmpCompiled
-                    + " skipped=" + trueVmpSkipped);
-            if (!trueVmpUnsupportedOpcodes.isEmpty()) {
-                System.out.println("TRUE_VMP unsupported opcodes (count): "
-                        + trueVmpUnsupportedOpcodes);
-            }
+            System.out.println(pvm2Admission.admissionLine());
+            System.out.println(pvm2Admission.skipReasonsLine());
+            System.out.println(pvm2Admission.unsupportedOpcodesLine());
 
             // Write code.bin (only DEXes that actually hollowed methods; may be empty)
             File codeBin = new File(assetsProtector, "code.bin");
@@ -722,6 +730,11 @@ public class PackerMain {
             System.out.println("dexes.zip entries=" + dexFiles.size()
                     + " (all business DEX; no plaintext multidex in base.apk)");
             encryptDexesZipPdx1(dexZip, dexAesKey);
+            String dexHmacHex = CryptoUtils.toHex(
+                    CryptoUtils.hmacSha256(hmacKey, Files.readAllBytes(dexZip.toPath())));
+            String codeHmacHex = CryptoUtils.toHex(
+                    CryptoUtils.hmacSha256(hmacKey, Files.readAllBytes(codeBin.toPath())));
+            String codeMethodsHmacHex = CodeMethodsIntegrity.hmacHex(hmacKey, all);
 
             boolean wroteSokeys = false;
             if (protectSo) {
@@ -737,7 +750,7 @@ public class PackerMain {
                 soResult = BusinessSoProtector.protectAll(new File(unpack, "lib"), soOpts);
                 List<BusinessSoProtector.Entry> soEntries = soResult.entries;
                 if (!soEntries.isEmpty()) {
-                    byte[] sokeys = BusinessSoProtector.buildSokeysBlob(soEntries, dexAesKey);
+                    byte[] sokeys = BusinessSoProtector.buildSokeysBlob(soEntries, soAesKey);
                     Files.write(new File(assetsProtector, "sokeys.bin").toPath(), sokeys);
                     wroteSokeys = true;
                     System.out.println("Wrote sokeys.bin entries=" + soEntries.size()
@@ -747,49 +760,55 @@ public class PackerMain {
                 }
             }
 
-            String appSignSha256 = resolveAppSignSha256(inputApk, signConfig);
-            if (appSignSha256 == null || appSignSha256.isEmpty()) {
-                throw new IllegalStateException(
-                        "Failed to resolve app_sign_sha256. Provide --cert-sha256 <hex>, "
-                                + "or --keystore (uses that cert), or a signed input APK.");
-            }
-
-            byte[] assetsAesKey = null;
             int assetsEncrypted = 0;
             if (encryptAssets) {
                 phase("encrypt_assets", "Encrypting app assets", 55);
-                assetsAesKey = new byte[16];
-                new SecureRandom().nextBytes(assetsAesKey);
                 AssetsEncryptor.Result ar = AssetsEncryptor.encryptAll(unpack, assetsAesKey);
                 assetsEncrypted = ar.encrypted;
                 System.out.println("Assets encrypt: files=" + ar.encrypted
                         + " skipped=" + ar.skipped);
-                if (ar.encrypted == 0) {
-                    // No business assets — drop key so SO symbol stays zero / unused.
-                    assetsAesKey = null;
-                }
             }
 
-            // config.json — insn/dex/assets AES keys live in SO symbols, not here.
+            // Embed shell before config.json so bitcode_hmac.<abi> can be HMAC-covered.
+            phase("manifest", "Rewriting manifest / embedding shell", 60);
+            writeApplicationName(new File(unpack, "AndroidManifest.xml"), PROXY_APP);
+            tryWriteAppComponentFactory(new File(unpack, "AndroidManifest.xml"), PROXY_ACF);
+            setExtractNativeLibs(new File(unpack, "AndroidManifest.xml"));
+
+            Map<String, String> bitcodeHmac = embedShell(unpack, shellHint, kWrap, kMaster, hmacKey);
+            Arrays.fill(kMaster, (byte) 0);
+            Arrays.fill(kWrap, (byte) 0);
+
+            // config.json — AES/HMAC keys are HKDF-derived at runtime, not stored here.
             // HMAC-SHA256 protects risk_flags / rasp_action / app_sign_sha256 / protect_so /
-            // encrypt_assets / net_guard / so_decrypt_mode.
+            // encrypt_assets / net_guard / so_decrypt_mode / package / vmp_lru /
+            // dex_hmac / code_hmac / code_methods_hmac / bitcode_hmac.
             boolean netGuardOn = detectProxy || !pinCertSha256.isEmpty();
             if (netGuardOn) {
                 writeNetGuardJson(assetsProtector, detectProxy, pinCertSha256);
             }
             String soDecryptWire = ProtectOptions.soDecryptModeWire(soDecryptMode);
+            String bitcodeHmacJson = formatBitcodeHmacJson(bitcodeHmac);
             String configPayload = String.format(Locale.US,
                     "{\"application_name\":\"%s\",\"insns_xor_key\":%d,"
                             + "\"risk_flags\":%d,\"rasp_action\":%d,\"report_enabled\":%s,"
                             + "\"app_sign_sha256\":\"%s\",\"protect_so\":%s,\"encrypt_assets\":%s,"
-                            + "\"detect_proxy\":%s,\"net_guard\":%s,\"so_decrypt_mode\":\"%s\"",
+                            + "\"detect_proxy\":%s,\"net_guard\":%s,\"so_decrypt_mode\":\"%s\","
+                            + "\"package\":\"%s\",\"vmp_lru\":%d,\"dex_hmac\":\"%s\","
+                            + "\"code_hmac\":\"%s\",\"code_methods_hmac\":\"%s\",\"bitcode_hmac\":%s",
                     escapeJson(originalApp == null ? "" : originalApp), xorKey,
                     riskFlags, raspAction, reportEnabled ? "true" : "false", appSignSha256,
                     wroteSokeys ? "true" : "false",
                     (assetsEncrypted > 0) ? "true" : "false",
                     detectProxy ? "true" : "false",
                     netGuardOn ? "true" : "false",
-                    soDecryptWire);
+                    soDecryptWire,
+                    escapeJson(packageName),
+                    32,
+                    dexHmacHex,
+                    codeHmacHex,
+                    codeMethodsHmacHex,
+                    bitcodeHmacJson);
             String hmac = computeHmacHex(configPayload, hmacKey);
             String config = configPayload + ",\"_hmac\":\"" + hmac + "\"}\n";
             Files.writeString(new File(assetsProtector, "config.json").toPath(), config,
@@ -800,21 +819,16 @@ public class PackerMain {
                     + " report_enabled=" + reportEnabled
                     + " protect_so=" + wroteSokeys
                     + " so_decrypt_mode=" + soDecryptWire
+                    + " vmp_lru=32"
+                    + " dex_hmac=set"
+                    + " code_hmac=set"
+                    + " code_methods_hmac=set"
+                    + " bitcode_hmac=" + bitcodeHmac.size()
                     + " encrypt_assets=" + (assetsEncrypted > 0)
                     + " res_protect=" + enableResProtect
                     + " detect_proxy=" + detectProxy
                     + " pin_certs=" + pinCertSha256.size());
 
-            // Rewrite manifest
-            phase("manifest", "Rewriting manifest / embedding shell", 60);
-            writeApplicationName(new File(unpack, "AndroidManifest.xml"), PROXY_APP);
-            tryWriteAppComponentFactory(new File(unpack, "AndroidManifest.xml"), PROXY_ACF);
-            setExtractNativeLibs(new File(unpack, "AndroidManifest.xml"));
-
-            // Embed shell + encrypt libprotector.so .bitcode with a separate SO AES key
-            byte[] soAesKey = new byte[16];
-            new SecureRandom().nextBytes(soAesKey);
-            embedShell(unpack, shellHint, soAesKey, aesKey, dexAesKey, hmacKey, assetsAesKey);
             embedJunkCodeDex(unpack, work.toFile());
 
             // size_report placeholder (output_mb refined beside output after pack)
@@ -879,8 +893,8 @@ public class PackerMain {
         }
     }
 
-    private void embedShell(File unpack, File shellHint, byte[] soAesKey, byte[] insnAesKey,
-                            byte[] dexAesKey, byte[] hmacKeyBytes, byte[] assetsAesKey)
+    private Map<String, String> embedShell(File unpack, File shellHint, byte[] kWrap, byte[] kMaster,
+                                           byte[] kHmac)
             throws Exception {
         File shellDex = findShellDex(shellHint);
         File shellLibs = findShellLibs(shellHint);
@@ -892,6 +906,7 @@ public class PackerMain {
         Files.copy(shellDex.toPath(), targetDex.toPath(), StandardCopyOption.REPLACE_EXISTING);
         System.out.println("Embedded shell dex: " + shellDex.getAbsolutePath());
 
+        Map<String, String> bitcodeHmac = new TreeMap<>();
         if (shellLibs != null && shellLibs.isDirectory()) {
             File libRoot = new File(unpack, "lib");
             Set<String> targetAbis = listTargetAbis(libRoot);
@@ -922,9 +937,9 @@ public class PackerMain {
                 for (File so : sos) {
                     File dest = new File(dstAbi, so.getName());
                     Files.copy(so.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                    if ("libprotector.so".equals(so.getName()) && soAesKey != null) {
-                        SoSectionEncryptor.encrypt(dest, soAesKey, insnAesKey, dexAesKey,
-                                hmacKeyBytes, assetsAesKey);
+                    if ("libprotector.so".equals(so.getName()) && kWrap != null) {
+                        String hmacHex = SoSectionEncryptor.encrypt(dest, kWrap, kMaster, kHmac);
+                        bitcodeHmac.put(abi, hmacHex);
                         hasProtector = true;
                     }
                     System.out.println("Embedded " + abi + "/" + so.getName());
@@ -941,8 +956,32 @@ public class PackerMain {
                                 + shellLibs.getAbsolutePath());
             }
         } else {
-            System.out.println("WARNING: shell libs not found under " + shellHint);
+            throw new IllegalStateException("shell libs not found under " + shellHint);
         }
+        if (bitcodeHmac.isEmpty()) {
+            throw new IllegalStateException("no libprotector.so embedded — cannot HMAC .bitcode");
+        }
+        return bitcodeHmac;
+    }
+
+    /** Compact JSON object for {@code bitcode_hmac}; keys sorted (TreeMap). */
+    static String formatBitcodeHmacJson(Map<String, String> bitcodeHmac) {
+        if (bitcodeHmac == null || bitcodeHmac.isEmpty()) {
+            throw new IllegalArgumentException("bitcode_hmac required");
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        boolean first = true;
+        for (Map.Entry<String, String> e : bitcodeHmac.entrySet()) {
+            if (e.getKey() == null || e.getValue() == null || e.getValue().length() != 64) {
+                throw new IllegalArgumentException("invalid bitcode_hmac entry for " + e.getKey());
+            }
+            if (!first) sb.append(',');
+            first = false;
+            sb.append('"').append(e.getKey()).append("\":\"").append(e.getValue()).append('"');
+        }
+        sb.append('}');
+        return sb.toString();
     }
 
     /**
@@ -1027,16 +1066,14 @@ public class PackerMain {
     }
 
     private static String computeApkCertSha256(File apk) throws Exception {
-        ApkVerifier.Result result = new ApkVerifier.Builder(apk).build().verify();
-        List<X509Certificate> certs = result.getSignerCertificates();
-        if (certs == null || certs.isEmpty()) {
+        String hex = ApkSignerCert.sha256Hex(apk);
+        if (hex == null || hex.isEmpty()) {
             throw new IllegalStateException(
-                    "Input APK has no signing certificate: " + apk.getAbsolutePath()
+                    "Input APK has no APK Signature Scheme v2/v3 certificate: "
+                            + apk.getAbsolutePath()
                             + ". Pass --cert-sha256 <hex> for the final signing cert.");
         }
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        byte[] hash = md.digest(certs.get(0).getEncoded());
-        return toHexLower(hash);
+        return hex;
     }
 
     private static String computeCertSha256(File keystore, String alias, String password)
@@ -1556,37 +1593,6 @@ public class PackerMain {
         }
     }
 
-    private void noteTrueVmpSkip(String failReason) {
-        if (failReason == null) {
-            return;
-        }
-        // Prefer "unsupported opcode 0xNN" histogram for Phase 0 telemetry.
-        final String marker = "unsupported opcode 0x";
-        int idx = failReason.indexOf(marker);
-        if (idx < 0) {
-            return;
-        }
-        int start = idx + marker.length();
-        int end = start;
-        while (end < failReason.length()) {
-            char c = failReason.charAt(end);
-            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-                end++;
-            } else {
-                break;
-            }
-        }
-        if (end == start) {
-            return;
-        }
-        try {
-            int opcode = Integer.parseInt(failReason.substring(start, end), 16);
-            trueVmpUnsupportedOpcodes.merge(opcode, 1, Integer::sum);
-        } catch (NumberFormatException ignored) {
-            // ignore malformed reasons
-        }
-    }
-
     private boolean shouldHollow(String typeDescriptor) {
         return protectPolicy.shouldHollow(typeDescriptor);
     }
@@ -1652,11 +1658,19 @@ public class PackerMain {
 
         com.android.dex.Code code = dex.readCode(method);
         short[] units = code.getInstructions();
-        if (units.length == 0) return null;
+        if (units.length == 0) {
+            if (phase == ExtractPhase.TRUE_VMP_ONLY) {
+                pvm2Admission.noteCandidate();
+            }
+            return null;
+        }
 
         byte[] returnBytes = getReturnByteCodes(returnType);
         int byteSize = units.length * 2;
         if (byteSize < returnBytes.length) {
+            if (phase == ExtractPhase.TRUE_VMP_ONLY) {
+                pvm2Admission.noteCandidate();
+            }
             return null;
         }
 
@@ -1671,11 +1685,11 @@ public class PackerMain {
         boolean isStatic = (method.getAccessFlags() & 0x0008) != 0; // ACC_STATIC
 
         if (phase == ExtractPhase.TRUE_VMP_ONLY) {
+            pvm2Admission.noteCandidate();
             Pvm2Compiler.Result compiled =
                     Pvm2Compiler.tryCompile(dex, code, returnType, isStatic, pvm2Morph);
             if (!compiled.isOk()) {
-                trueVmpSkipped++;
-                noteTrueVmpSkip(compiled.failReason);
+                pvm2Admission.noteFail(compiled.failReason);
                 System.out.println("TRUE_VMP skip " + typeDescriptor + "->" + methodName
                         + ": " + compiled.failReason);
                 return null;
@@ -1686,7 +1700,7 @@ public class PackerMain {
             plainSize = compiled.image.length;
             flags = VmCodec.FLAG_TRUE_VMP;
             Arrays.fill(original, (byte) 0);
-            trueVmpCompiled++;
+            pvm2Admission.noteSuccess();
             System.out.println("TRUE_VMP " + typeDescriptor + "->" + methodName
                     + (isStatic ? " [static]" : " [instance]")
                     + " pvm2=" + plainSize + "B isa="

@@ -5,7 +5,6 @@
 #include "crypto/insn_crypt.h"
 #include "vm/vm_codec.h"
 #include "risk/risk.h"
-#include "runtime/engine.h"
 
 #include <atomic>
 #include <cerrno>
@@ -20,7 +19,9 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
+#include <cstddef>
 #include <vector>
 #include <unordered_set>
 #include <unordered_map>
@@ -94,9 +95,175 @@ size_t read_methods(const uint8_t* data, size_t max_len, ClassDataMethod* out,
     return read;
 }
 
-static bool looks_like_dex(const uint8_t* begin) {
-    if (begin == nullptr) return false;
-    return begin[0] == 'd' && begin[1] == 'e' && begin[2] == 'x' && begin[3] == '\n';
+static bool ptr_userspace_plausible(const void* p) {
+    auto u = reinterpret_cast<uintptr_t>(p);
+    if (u < 0x1000u) return false;
+#ifdef __LP64__
+    if (u > 0x00007FFFFFFFFFFFULL) return false;
+#endif
+    return true;
+}
+
+/** Read without SIGSEGV. process_vm_readv first; ENOSYS/EPERM falls back to memcpy. */
+static bool safe_read(const void* addr, void* out, size_t n) {
+    if (out == nullptr || n == 0) return false;
+    if (!ptr_userspace_plausible(addr)) return false;
+    auto end = reinterpret_cast<uintptr_t>(addr) + (n - 1);
+    if (!ptr_userspace_plausible(reinterpret_cast<const void*>(end))) return false;
+
+    static int vm_readv_state = 0; // 0 unknown, 1 ok, -1 memcpy fallback
+    if (vm_readv_state < 0) {
+        memcpy(out, addr, n);
+        return true;
+    }
+
+    iovec local{out, n};
+    iovec remote{const_cast<void*>(addr), n};
+    ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (got == static_cast<ssize_t>(n)) {
+        vm_readv_state = 1;
+        return true;
+    }
+    // Some OEM kernels reject same-process vm_readv with EACCES/EINVAL;
+    // fall back to memcpy so probe still works (pre-XOM / normal DEX pages).
+    if (got < 0 && (errno == ENOSYS || errno == EPERM || errno == EACCES
+                    || errno == EINVAL)) {
+        vm_readv_state = -1;
+        memcpy(out, addr, n);
+        return true;
+    }
+    return false;
+}
+
+static bool location_chars_ok(const char* s, size_t n) {
+    if (s == nullptr || n == 0) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == 0) return false;
+        if (c < 0x20 && c != '\t') return false;
+        if (c == 0x7f) return false;
+    }
+    return true;
+}
+
+/** Copy libc++ std::string without deref'ing a corrupt object. */
+static bool try_copy_std_string(const void* str_obj, std::string* out) {
+    if (out == nullptr || !ptr_userspace_plausible(str_obj)) return false;
+    uint8_t raw[24] = {};
+    if (!safe_read(str_obj, raw, sizeof(raw))) return false;
+
+#ifdef __LP64__
+    uintptr_t long_data = 0;
+    size_t long_size = 0;
+    memcpy(&long_data, raw, sizeof(long_data));
+    memcpy(&long_size, raw + sizeof(void*), sizeof(long_size));
+    if (long_size > 0 && long_size < 4096
+        && ptr_userspace_plausible(reinterpret_cast<const void*>(long_data))) {
+        std::string tmp(long_size, '\0');
+        if (safe_read(reinterpret_cast<const void*>(long_data), tmp.data(), long_size)
+            && location_chars_ok(tmp.data(), long_size)) {
+            *out = std::move(tmp);
+            return true;
+        }
+    }
+    size_t short_size = static_cast<size_t>(raw[23] >> 1);
+    if (short_size > 0 && short_size <= 22
+        && location_chars_ok(reinterpret_cast<const char*>(raw), short_size)) {
+        out->assign(reinterpret_cast<const char*>(raw), short_size);
+        return true;
+    }
+#else
+    uintptr_t long_data = 0;
+    size_t long_size = 0;
+    memcpy(&long_data, raw, sizeof(long_data));
+    memcpy(&long_size, raw + sizeof(void*), sizeof(long_size));
+    if (long_size > 0 && long_size < 4096
+        && ptr_userspace_plausible(reinterpret_cast<const void*>(long_data))) {
+        std::string tmp(long_size, '\0');
+        if (safe_read(reinterpret_cast<const void*>(long_data), tmp.data(), long_size)
+            && location_chars_ok(tmp.data(), long_size)) {
+            *out = std::move(tmp);
+            return true;
+        }
+    }
+    size_t short_size = static_cast<size_t>(raw[11] >> 1);
+    if (short_size > 0 && short_size <= 10
+        && location_chars_ok(reinterpret_cast<const char*>(raw), short_size)) {
+        out->assign(reinterpret_cast<const char*>(raw), short_size);
+        return true;
+    }
+#endif
+    return false;
+}
+
+enum class LayoutProbe {
+    kUnsafe,
+    kInvalidLayout,
+    kOk,
+};
+
+struct DexLayout {
+    size_t off_begin;
+    size_t off_size;
+    bool has_size;
+    size_t off_location;
+    size_t off_header;
+};
+
+static LayoutProbe try_probe_layout(const void* dex_file, const DexLayout& layout,
+                                    DexView* view) {
+    if (view == nullptr) return LayoutProbe::kUnsafe;
+    if (!ptr_userspace_plausible(dex_file)) return LayoutProbe::kUnsafe;
+
+    const uint8_t* begin = nullptr;
+    if (!safe_read(reinterpret_cast<const char*>(dex_file) + layout.off_begin,
+                   &begin, sizeof(begin))) {
+        return LayoutProbe::kUnsafe;
+    }
+    if (!ptr_userspace_plausible(begin)) return LayoutProbe::kInvalidLayout;
+
+    uint8_t magic[4] = {};
+    if (!safe_read(begin, magic, sizeof(magic))) {
+        return LayoutProbe::kInvalidLayout;
+    }
+    if (!(magic[0] == 'd' && magic[1] == 'e' && magic[2] == 'x' && magic[3] == '\n')) {
+        return LayoutProbe::kInvalidLayout;
+    }
+
+    std::string location;
+    if (!try_copy_std_string(
+                reinterpret_cast<const char*>(dex_file) + layout.off_location,
+                &location)) {
+        return LayoutProbe::kInvalidLayout;
+    }
+
+    size_t size = 0;
+    if (layout.has_size) {
+        if (!safe_read(reinterpret_cast<const char*>(dex_file) + layout.off_size,
+                       &size, sizeof(size))) {
+            size = 0;
+        }
+    }
+    if (size == 0) {
+        const void* header = nullptr;
+        if (safe_read(reinterpret_cast<const char*>(dex_file) + layout.off_header,
+                      &header, sizeof(header))
+            && ptr_userspace_plausible(header)) {
+            uint32_t file_size = 0;
+            if (safe_read(reinterpret_cast<const uint8_t*>(header) + 32,
+                          &file_size, sizeof(file_size))) {
+                size = file_size;
+            }
+        }
+    }
+    if (size == 0 || size > 256u * 1024u * 1024u) {
+        return LayoutProbe::kInvalidLayout;
+    }
+
+    view->begin = begin;
+    view->size = size;
+    view->location = std::move(location);
+    return LayoutProbe::kOk;
 }
 
 /** Normalize path separators and check protected dex location by path segments. */
@@ -150,47 +317,68 @@ DexView probe_dex_file(const void* dex_file, int sdk_level) {
     DexView view;
     if (dex_file == nullptr) return view;
 
-    try {
-        if (sdk_level >= 35) {
-            auto* f = reinterpret_cast<const V35::DexFile*>(dex_file);
-            view.begin = f->begin_;
-            view.location = f->location_;
-            if (f->header_) {
-                uint32_t file_size = 0;
-                memcpy(&file_size, reinterpret_cast<const uint8_t*>(f->header_) + 32, 4);
-                view.size = file_size;
-            }
-        } else if (sdk_level >= 28) {
-            auto* f = reinterpret_cast<const V28::DexFile*>(dex_file);
-            view.begin = f->begin_;
-            view.location = f->location_;
-            view.size = f->size_ != 0 ? f->size_ : 0;
-            if (view.size == 0 && f->header_) {
-                uint32_t file_size = 0;
-                memcpy(&file_size, reinterpret_cast<const uint8_t*>(f->header_) + 32, 4);
-                view.size = file_size;
-            }
-        } else {
-            auto* f = reinterpret_cast<const V21::DexFile*>(dex_file);
-            view.begin = f->begin_;
-            view.location = f->location_;
-            view.size = f->size_ != 0 ? f->size_ : 0;
-            if (view.size == 0 && f->header_) {
-                uint32_t file_size = 0;
-                memcpy(&file_size, reinterpret_cast<const uint8_t*>(f->header_) + 32, 4);
-                view.size = file_size;
-            }
-        }
-    } catch (...) {
-        PLOGE("DexFile probe exception");
-        return view;
+    const DexLayout kV35{
+            offsetof(V35::DexFile, begin_),
+            offsetof(V35::DexFile, unused_size_),
+            false,
+            offsetof(V35::DexFile, location_),
+            offsetof(V35::DexFile, header_),
+    };
+    const DexLayout kV28{
+            offsetof(V28::DexFile, begin_),
+            offsetof(V28::DexFile, size_),
+            true,
+            offsetof(V28::DexFile, location_),
+            offsetof(V28::DexFile, header_),
+    };
+    const DexLayout kV21{
+            offsetof(V21::DexFile, begin_),
+            offsetof(V21::DexFile, size_),
+            true,
+            offsetof(V21::DexFile, location_),
+            offsetof(V21::DexFile, header_),
+    };
+
+    DexLayout order[3];
+    int n = 0;
+    if (sdk_level >= 35) {
+        order[n++] = kV35;
+        order[n++] = kV28;
+        order[n++] = kV21;
+    } else if (sdk_level >= 28) {
+        order[n++] = kV28;
+        order[n++] = kV35;
+        order[n++] = kV21;
+    } else {
+        order[n++] = kV21;
+        order[n++] = kV28;
+        order[n++] = kV35;
     }
 
-    if (!looks_like_dex(view.begin)) {
-        PLOGW("DexFile begin magic mismatch, location=%s", view.location.c_str());
+    bool filled = false;
+    for (int i = 0; i < n; i++) {
+        DexView candidate;
+        LayoutProbe r = try_probe_layout(dex_file, order[i], &candidate);
+        if (r == LayoutProbe::kOk) {
+            view = std::move(candidate);
+            filled = true;
+            break;
+        }
+        if (r == LayoutProbe::kUnsafe) {
+            static std::atomic_bool logged{false};
+            if (!logged.exchange(true)) {
+                PLOGE("DexFile probe unsafe sdk=%d (further skips silent)", sdk_level);
+            }
+            view.valid = false;
+            return view;
+        }
+        // kInvalidLayout: try next candidate
+    }
+    if (!filled) {
         view.valid = false;
         return view;
     }
+
     if (!is_protected_dex_location(view.location)) {
         view.valid = false;
         return view;
@@ -531,8 +719,6 @@ PROTECTOR_ENCRYPT void patch_class(const char* descriptor, const void* dex_file,
     auto& state = runtime_state();
     if (!state.inited.load()) return;
 
-    protector::runtime::maybe_verify_junk_class();
-
     if (descriptor != nullptr && strstr(descriptor, kJunkClassPath) != nullptr) {
         size_t len = strlen(descriptor);
         if (len >= 2 && isdigit(static_cast<unsigned char>(descriptor[len - 2]))) {
@@ -662,6 +848,160 @@ PROTECTOR_ENCRYPT void patch_class(const char* descriptor, const void* dex_file,
 
 static bool dex_magic_ok(const uint8_t* begin, size_t size) {
     return size >= 112 && begin[0] == 'd' && begin[1] == 'e' && begin[2] == 'x' && begin[3] == '\n';
+}
+
+static bool collect_coded_method_ids(const uint8_t* begin, size_t size,
+                                     uint32_t* method_ids_size_out,
+                                     std::unordered_set<uint32_t>* out) {
+    if (begin == nullptr || out == nullptr || method_ids_size_out == nullptr) return false;
+    if (!dex_magic_ok(begin, size)) return false;
+    uint32_t method_ids_size = 0;
+    memcpy(&method_ids_size, begin + 88, 4);
+    *method_ids_size_out = method_ids_size;
+
+    uint32_t class_defs_size = 0;
+    uint32_t class_defs_off = 0;
+    memcpy(&class_defs_size, begin + 96, 4);
+    memcpy(&class_defs_off, begin + 100, 4);
+    if (class_defs_off == 0 || class_defs_size == 0) return true;
+    if (static_cast<uint64_t>(class_defs_off)
+                + static_cast<uint64_t>(class_defs_size) * sizeof(ClassDef) > size) {
+        return false;
+    }
+    auto* defs = reinterpret_cast<const ClassDef*>(begin + class_defs_off);
+    for (uint32_t i = 0; i < class_defs_size; i++) {
+        const ClassDef& class_def = defs[i];
+        if (class_def.class_data_off_ == 0) continue;
+        if (static_cast<uint64_t>(class_def.class_data_off_) >= size) continue;
+        const uint8_t* class_data = begin + class_def.class_data_off_;
+        size_t remain = size - class_def.class_data_off_;
+        size_t read = 0;
+        bool ok = false;
+        uint64_t static_fields = 0, instance_fields = 0, direct_methods = 0, virtual_methods = 0;
+        size_t n = read_uleb128(class_data + read, remain - read, &static_fields, &ok);
+        if (!ok) return false;
+        read += n;
+        n = read_uleb128(class_data + read, remain - read, &instance_fields, &ok);
+        if (!ok) return false;
+        read += n;
+        n = read_uleb128(class_data + read, remain - read, &direct_methods, &ok);
+        if (!ok) return false;
+        read += n;
+        n = read_uleb128(class_data + read, remain - read, &virtual_methods, &ok);
+        if (!ok) return false;
+        read += n;
+        if (direct_methods > kMaxMethodsPerClass || virtual_methods > kMaxMethodsPerClass
+            || static_fields > kMaxMethodsPerClass || instance_fields > kMaxMethodsPerClass) {
+            return false;
+        }
+        n = skip_fields(class_data + read, remain - read, static_fields, &ok);
+        if (!ok) return false;
+        read += n;
+        n = skip_fields(class_data + read, remain - read, instance_fields, &ok);
+        if (!ok) return false;
+        read += n;
+        std::vector<ClassDataMethod> directs(static_cast<size_t>(direct_methods));
+        std::vector<ClassDataMethod> virtuals(static_cast<size_t>(virtual_methods));
+        if (direct_methods > 0) {
+            n = read_methods(class_data + read, remain - read, directs.data(), direct_methods, &ok);
+            if (!ok) return false;
+            read += n;
+        }
+        if (virtual_methods > 0) {
+            n = read_methods(class_data + read, remain - read, virtuals.data(), virtual_methods, &ok);
+            if (!ok) return false;
+        }
+        auto take = [&](const ClassDataMethod& m) {
+            if (m.code_off != 0) {
+                out->insert(m.method_idx);
+            }
+        };
+        for (const auto& m : directs) take(m);
+        for (const auto& m : virtuals) take(m);
+    }
+    return true;
+}
+
+bool verify_code_methods_in_extracted_dexes(const char* protector_dir) {
+    auto& state = runtime_state();
+    if (state.code_map.empty()) {
+        return true;
+    }
+    if (protector_dir == nullptr || protector_dir[0] == '\0') {
+        PLOGE("code methods: protector dir empty");
+        return false;
+    }
+
+    std::unordered_map<int, std::unordered_set<uint32_t>> needed;
+    for (const auto& dex : state.code_map) {
+        for (const auto& kv : dex.second) {
+            if (kv.second == nullptr) continue;
+            needed[dex.first].insert(kv.first);
+        }
+    }
+    if (needed.empty()) {
+        return true;
+    }
+
+    DIR* dir = opendir(protector_dir);
+    if (dir == nullptr) {
+        PLOGE("code methods: opendir failed %s", protector_dir);
+        return false;
+    }
+    std::unordered_map<int, std::string> dex_files;
+    while (dirent* ent = readdir(dir)) {
+        if (ent->d_name[0] == '.') continue;
+        std::string name = ent->d_name;
+        if (name.size() < 5 || name.compare(name.size() - 4, 4, ".dex") != 0) continue;
+        if (name.rfind("classes", 0) != 0) continue;
+        int dex_index = parse_dex_number(name);
+        dex_files[dex_index] = std::string(protector_dir) + "/" + name;
+    }
+    closedir(dir);
+
+    for (const auto& need : needed) {
+        auto it = dex_files.find(need.first);
+        if (it == dex_files.end()) {
+            PLOGE("code methods: no extracted DEX for dex=%d", need.first);
+            return false;
+        }
+        int fd = open(it->second.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            PLOGE("code methods: open failed %s errno=%d", it->second.c_str(), errno);
+            return false;
+        }
+        struct stat st {};
+        if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+            close(fd);
+            PLOGE("code methods: stat failed %s", it->second.c_str());
+            return false;
+        }
+        void* map = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (map == MAP_FAILED) {
+            PLOGE("code methods: mmap failed %s errno=%d", it->second.c_str(), errno);
+            return false;
+        }
+        uint32_t method_ids_size = 0;
+        std::unordered_set<uint32_t> coded;
+        bool ok = collect_coded_method_ids(reinterpret_cast<const uint8_t*>(map),
+                                           static_cast<size_t>(st.st_size),
+                                           &method_ids_size, &coded);
+        munmap(map, static_cast<size_t>(st.st_size));
+        if (!ok) {
+            PLOGE("code methods: parse DEX failed %s", it->second.c_str());
+            return false;
+        }
+        for (uint32_t idx : need.second) {
+            if (idx >= method_ids_size || coded.count(idx) == 0) {
+                PLOGE("code methods: dex=%d method_idx=%u missing in extracted DEX",
+                      need.first, idx);
+                return false;
+            }
+        }
+    }
+    PLOGI("code methods: matched extracted DEX dexes=%zu", needed.size());
+    return true;
 }
 
 /** DEX Adler32 (same as zlib adler32 starting from 1). */

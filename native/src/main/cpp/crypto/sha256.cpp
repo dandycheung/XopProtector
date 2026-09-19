@@ -3,6 +3,7 @@
  * Optimised for ARM64; no malloc, no external deps.
  */
 #include "crypto/sha256.h"
+#include <cstring>
 #include <string.h>
 
 namespace protector::crypto {
@@ -119,35 +120,34 @@ void sha256_final(sha256_ctx* ctx, uint8_t digest[32]) {
 
 // ── HMAC-SHA-256 ────────────────────────────────────────────────────
 
-void hmac_sha256(const uint8_t* key, size_t key_len,
-                 const void* data, size_t data_len,
-                 uint8_t mac_out[32]) {
+void hmac_sha256_parts(const uint8_t* key, size_t key_len,
+                       const void* const* parts, const size_t* lens, size_t nparts,
+                       uint8_t mac_out[32]) {
     uint8_t key_block[64] = {0};
     const size_t block_sz = 64;
 
-    // Step 1 — key derivation
     if (key_len > block_sz) {
         sha256_ctx ctx;
         sha256_init(&ctx);
         sha256_update(&ctx, key, key_len);
-        sha256_final(&ctx, key_block);  // hash → first 32 bytes of key_block
-        // rest stays 0
-    } else {
+        sha256_final(&ctx, key_block);
+    } else if (key != nullptr && key_len > 0) {
         memcpy(key_block, key, key_len);
     }
 
-    // Step 2 — inner: H((K ^ ipad) || msg)
     uint8_t inner_key[64];
     for (int i = 0; i < 64; i++) inner_key[i] = key_block[i] ^ 0x36;
 
     sha256_ctx inner;
     sha256_init(&inner);
     sha256_update(&inner, inner_key, 64);
-    sha256_update(&inner, data, data_len);
+    for (size_t i = 0; i < nparts; i++) {
+        if (lens[i] == 0) continue;
+        sha256_update(&inner, parts[i], lens[i]);
+    }
     uint8_t inner_hash[32];
     sha256_final(&inner, inner_hash);
 
-    // Step 3 — outer: H((K ^ opad) || inner_hash)
     uint8_t outer_key[64];
     for (int i = 0; i < 64; i++) outer_key[i] = key_block[i] ^ 0x5c;
 
@@ -156,6 +156,178 @@ void hmac_sha256(const uint8_t* key, size_t key_len,
     sha256_update(&outer, outer_key, 64);
     sha256_update(&outer, inner_hash, 32);
     sha256_final(&outer, mac_out);
+
+    memset(key_block, 0, sizeof(key_block));
+    memset(inner_key, 0, sizeof(inner_key));
+    memset(outer_key, 0, sizeof(outer_key));
+    memset(inner_hash, 0, sizeof(inner_hash));
+}
+
+void hmac_sha256(const uint8_t* key, size_t key_len,
+                 const void* data, size_t data_len,
+                 uint8_t mac_out[32]) {
+    const void* parts[1] = {data};
+    size_t lens[1] = {data_len};
+    hmac_sha256_parts(key, key_len, parts, lens, 1, mac_out);
+}
+
+// ── HKDF-SHA256 (RFC 5869) ──────────────────────────────────────────
+
+static bool hkdf_expand(const uint8_t prk[32],
+                        const uint8_t* info, size_t info_len,
+                        uint8_t* out, size_t out_len) {
+    if (info_len > 4096u) {
+        return false;
+    }
+    uint8_t t[32] = {0};
+    size_t t_len = 0;
+    size_t filled = 0;
+    uint8_t block[32 + 4096 + 1];
+    uint8_t n = static_cast<uint8_t>((out_len + 31u) / 32u);
+    for (uint8_t i = 1; i <= n; i++) {
+        size_t blen = t_len + info_len + 1;
+        if (t_len > 0) {
+            memcpy(block, t, t_len);
+        }
+        if (info_len > 0 && info != nullptr) {
+            memcpy(block + t_len, info, info_len);
+        }
+        block[t_len + info_len] = i;
+        hmac_sha256(prk, 32, block, blen, t);
+        t_len = 32;
+        size_t copy = out_len - filled;
+        if (copy > 32) copy = 32;
+        memcpy(out + filled, t, copy);
+        filled += copy;
+    }
+    memset(t, 0, sizeof(t));
+    memset(block, 0, sizeof(block));
+    return true;
+}
+
+bool hkdf_sha256(const uint8_t* ikm, size_t ikm_len,
+                 const uint8_t* salt, size_t salt_len,
+                 const uint8_t* info, size_t info_len,
+                 uint8_t* out, size_t out_len) {
+    if (ikm == nullptr && ikm_len != 0) return false;
+    if (out == nullptr || out_len == 0 || out_len > HKDF_MAX_OUT_LEN) return false;
+    if (salt == nullptr && salt_len != 0) return false;
+    if (info == nullptr && info_len != 0) return false;
+
+    uint8_t zero_salt[SHA256_LEN] = {0};
+    const uint8_t* salt_ptr = salt;
+    size_t salt_n = salt_len;
+    if (salt_n == 0) {
+        salt_ptr = zero_salt;
+        salt_n = SHA256_LEN;
+    }
+
+    uint8_t prk[32];
+    hmac_sha256(salt_ptr, salt_n, ikm_len == 0 ? nullptr : ikm, ikm_len, prk);
+
+    bool ok = hkdf_expand(prk, info, info_len, out, out_len);
+    memset(prk, 0, sizeof(prk));
+    memset(zero_salt, 0, sizeof(zero_salt));
+    return ok;
+}
+
+#define PROT_RODATA __attribute__((section(".rodata.prot"), used))
+
+bool hkdf_self_test() {
+    // RFC 5869 A.1
+    static const uint8_t kIkm1[22] PROT_RODATA = {
+        0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,
+        0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b
+    };
+    static const uint8_t kSalt1[13] PROT_RODATA = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c
+    };
+    static const uint8_t kInfo1[10] PROT_RODATA = {
+        0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9
+    };
+    static const uint8_t kOkm1[42] PROT_RODATA = {
+        0x3c,0xb2,0x5f,0x25,0xfa,0xac,0xd5,0x7a,0x90,0x43,0x4f,0x64,0xd0,0x36,0x2f,0x2a,
+        0x2d,0x2d,0x0a,0x90,0xcf,0x1a,0x5a,0x4c,0x5d,0xb0,0x2d,0x56,0xec,0xc4,0xc5,0xbf,
+        0x34,0x00,0x72,0x08,0xd5,0xb8,0x87,0x18,0x58,0x65
+    };
+    uint8_t out1[42];
+    if (!hkdf_sha256(kIkm1, sizeof(kIkm1), kSalt1, sizeof(kSalt1),
+                     kInfo1, sizeof(kInfo1), out1, sizeof(out1))) {
+        return false;
+    }
+    if (memcmp(out1, kOkm1, sizeof(kOkm1)) != 0) return false;
+
+    // RFC 5869 A.3 — empty salt and info
+    static const uint8_t kOkm3[42] PROT_RODATA = {
+        0x8d,0xa4,0xe7,0x75,0xa5,0x63,0xc1,0x8f,0x71,0x5f,0x80,0x2a,0x06,0x3c,0x5a,0x31,
+        0xb8,0xa1,0x1f,0x5c,0x5e,0xe1,0x87,0x9e,0xc3,0x45,0x4e,0x5f,0x3c,0x73,0x8d,0x2d,
+        0x9d,0x20,0x13,0x95,0xfa,0xa4,0xb6,0x1a,0x96,0xc8
+    };
+    uint8_t out3[42];
+    if (!hkdf_sha256(kIkm1, sizeof(kIkm1), nullptr, 0, nullptr, 0, out3, sizeof(out3))) {
+        return false;
+    }
+    if (memcmp(out3, kOkm3, sizeof(kOkm3)) != 0) return false;
+
+    // XopProtector domain-separation fixture (must match HkdfSha256Test)
+    uint8_t master[32];
+    uint8_t cert[32];
+    for (int i = 0; i < 32; i++) {
+        master[i] = static_cast<uint8_t>(i);
+        cert[i] = static_cast<uint8_t>(0x20 + i);
+    }
+    static const uint8_t kInfoDex[] PROT_RODATA = {
+        // "xop-dex-v1" || "com.yqsh.protectordemo"
+        0x78,0x6f,0x70,0x2d,0x64,0x65,0x78,0x2d,0x76,0x31,
+        0x63,0x6f,0x6d,0x2e,0x79,0x71,0x73,0x68,0x2e,0x70,
+        0x72,0x6f,0x74,0x65,0x63,0x74,0x6f,0x72,0x64,0x65,0x6d,0x6f
+    };
+    static const uint8_t kDex16[16] PROT_RODATA = {
+        0x37,0x7c,0xe3,0xca,0x1c,0xeb,0x73,0xaa,0x03,0x18,0x64,0x37,0x21,0xa0,0xa8,0x4a
+    };
+    uint8_t dex[16];
+    if (!hkdf_sha256(master, 32, cert, 32, kInfoDex, sizeof(kInfoDex), dex, 16)) {
+        return false;
+    }
+    if (memcmp(dex, kDex16, sizeof(kDex16)) != 0) return false;
+
+    static const uint8_t kInfoSo[] PROT_RODATA = {
+        // "xop-so-v1" || "com.yqsh.protectordemo"
+        0x78,0x6f,0x70,0x2d,0x73,0x6f,0x2d,0x76,0x31,
+        0x63,0x6f,0x6d,0x2e,0x79,0x71,0x73,0x68,0x2e,0x70,
+        0x72,0x6f,0x74,0x65,0x63,0x74,0x6f,0x72,0x64,0x65,0x6d,0x6f
+    };
+    static const uint8_t kSo16[16] PROT_RODATA = {
+        0x54,0x42,0xb8,0xe8,0xc5,0xac,0x63,0xa1,0x3a,0xdf,0xab,0x1c,0xb0,0x38,0x57,0x85
+    };
+    uint8_t so[16];
+    if (!hkdf_sha256(master, 32, cert, 32, kInfoSo, sizeof(kInfoSo), so, 16)) {
+        return false;
+    }
+    if (memcmp(so, kSo16, sizeof(kSo16)) != 0) return false;
+
+    static const uint8_t kInfoHmac[] PROT_RODATA = {
+        // "xop-hmac-v1" || "com.yqsh.protectordemo"
+        0x78,0x6f,0x70,0x2d,0x68,0x6d,0x61,0x63,0x2d,0x76,0x31,
+        0x63,0x6f,0x6d,0x2e,0x79,0x71,0x73,0x68,0x2e,0x70,
+        0x72,0x6f,0x74,0x65,0x63,0x74,0x6f,0x72,0x64,0x65,0x6d,0x6f
+    };
+    static const uint8_t kHmac32[32] PROT_RODATA = {
+        0x91,0x76,0x68,0x23,0xd4,0xae,0x9f,0xea,0xa9,0xd3,0xf8,0xab,0x39,0x0a,0x2e,0x3d,
+        0x50,0x4f,0xad,0xe7,0xaf,0xee,0x6b,0x9f,0xfb,0x11,0xec,0x7e,0xae,0x5d,0xe6,0x88
+    };
+    uint8_t hmac[32];
+    if (!hkdf_sha256(master, 32, cert, 32, kInfoHmac, sizeof(kInfoHmac), hmac, 32)) {
+        return false;
+    }
+    if (memcmp(hmac, kHmac32, sizeof(kHmac32)) != 0) return false;
+
+    memset(master, 0, sizeof(master));
+    memset(cert, 0, sizeof(cert));
+    memset(dex, 0, sizeof(dex));
+    memset(so, 0, sizeof(so));
+    memset(hmac, 0, sizeof(hmac));
+    return true;
 }
 
 } // namespace protector::crypto

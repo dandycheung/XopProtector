@@ -256,7 +256,8 @@
                     <TextBlock Text="{x:Static res:Strings.Harden_AutoVmpSlowTip}" FontSize="10"
                                Foreground="{DynamicResource TextFaint}" TextWrapping="Wrap" Margin="0,0,0,12"/>
 
-                    <!-- Extra protect (assets / res / NetGuard): hidden — not transparent for third-party APKs -->
+                    <!-- Extra protect (assets / res / NetGuard / pin): hidden; CLI-only for now.
+                         encrypt-assets requires ProtectorAssets; no transparent AssetManager hook. -->
                     <StackPanel x:Name="ExtraProtectPanel" Visibility="Collapsed">
                       <TextBlock Text="{x:Static res:Strings.Harden_ExtraProtectSection}" FontSize="11" FontWeight="Medium"
                                  Foreground="{DynamicResource TextDim}" Margin="0,0,0,6"/>
@@ -305,7 +306,8 @@
                              AcceptsReturn="True" MinHeight="44" TextWrapping="Wrap"
                              VerticalScrollBarVisibility="Auto"/>
 
-                    <!-- 5) Cert pin + channel -->
+                    <!-- Cert pin: Desktop-hidden for now (CLI pin-certs); channel stays available. -->
+                    <StackPanel Visibility="Collapsed">
                     <TextBlock Text="{x:Static res:Strings.Harden_PinCerts}" FontSize="11" FontWeight="Medium"
                                Foreground="{DynamicResource TextDim}" Margin="0,0,0,4"/>
                     <Grid Margin="0,0,0,12">
@@ -325,7 +327,9 @@
                         </Viewbox>
                       </Button>
                     </Grid>
+                    </StackPanel>
 
+                    <!-- 5) Channel -->
                     <TextBlock Text="{x:Static res:Strings.Harden_Channel}" FontSize="11" FontWeight="Medium"
                                Foreground="{DynamicResource TextDim}" Margin="0,0,0,4"/>
                     <TextBox x:Name="ChannelBox" Style="{StaticResource DarkInput}" Margin="0,0,0,4"

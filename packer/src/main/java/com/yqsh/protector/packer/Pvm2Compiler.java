@@ -21,6 +21,9 @@ import java.util.Map;
 public final class Pvm2Compiler {
     private static final int MAX_REGS = 32;
     private static final int MAX_CODE_UNITS = 512;
+    private static final int PACKED_SWITCH_IDENT = 0x0100;
+    private static final int SPARSE_SWITCH_IDENT = 0x0200;
+    private static final int FILL_ARRAY_DATA_IDENT = 0x0300;
 
     public static final class Result {
         public final byte[] image;
@@ -62,10 +65,12 @@ public final class Pvm2Compiler {
         int retKind = retKindOf(returnType);
         if (retKind < 0) return Result.fail("unsupported return " + returnType);
 
-        // Extra scratch reg for binop/lit* lowering (avoids clobber when dst==src).
+        // Extra scratch: lit* / packed-switch use +1; fill-array-data needs +2 (index+value),
+        // or +3 when element_width is 8 (wide value pair).
         int dalvikRegs = code.getRegistersSize();
+        int extra = extraRegsForUnits(units);
         int scratchReg = dalvikRegs;
-        int totalRegs = dalvikRegs + 1;
+        int totalRegs = dalvikRegs + extra;
         if (totalRegs > MAX_REGS) return Result.fail("too many regs (+scratch)");
 
         if (morph == null) {
@@ -85,8 +90,8 @@ public final class Pvm2Compiler {
             dalvikPcToEmitIndex.put(pc, emits.size());
             int op = units[pc] & 0xff;
             try {
-                int advance = translateOne(dex, units, pc, op, scratchReg, strings, methodPool, fieldPool,
-                        typePool, emits, fixups);
+                int advance = translateOne(dex, units, pc, op, scratchReg, totalRegs, strings,
+                        methodPool, fieldPool, typePool, emits, fixups);
                 if (advance <= 0) {
                     return Result.fail("bad advance at pc=" + pc + " op=0x" + Integer.toHexString(op));
                 }
@@ -132,7 +137,7 @@ public final class Pvm2Compiler {
 
         try {
             morph.morphCodeInPlace(codeBytes);
-            return Result.ok(buildImageV3(totalRegs, code.getInsSize(), retKind, morph,
+            return Result.ok(buildImageV3(totalRegs, extra, code.getInsSize(), retKind, morph,
                     strings, methodPool, fieldPool, typePool, handlers, codeBytes));
         } catch (IOException e) {
             return Result.fail(e.getMessage());
@@ -270,7 +275,7 @@ public final class Pvm2Compiler {
     }
 
     private static int translateOne(Dex dex, short[] units, int pc, int op,
-                                    int scratchReg,
+                                    int scratchReg, int totalRegs,
                                     List<String> strings,
                                     List<Integer> methodPool,
                                     List<Integer> fieldPool,
@@ -278,9 +283,16 @@ public final class Pvm2Compiler {
                                     List<Emit> emits, List<Fixup> fixups) {
         int u0 = units[pc] & 0xffff;
         switch (op) {
-            case 0x00:
+            case 0x00: {
+                int ident = u0;
+                if (ident == PACKED_SWITCH_IDENT
+                        || ident == SPARSE_SWITCH_IDENT
+                        || ident == FILL_ARRAY_DATA_IDENT) {
+                    return payloadWidth(units, pc);
+                }
                 emits.add(Emit.of(Pvm2Opcodes.OP_NOP));
                 return 1;
+            }
             case 0x01: {
                 emits.add(Emit.of(Pvm2Opcodes.OP_MOVE, (u0 >> 8) & 0x0f, (u0 >> 12) & 0x0f));
                 return 1;
@@ -429,9 +441,16 @@ public final class Pvm2Compiler {
             case 0x25: { // filled-new-array/range
                 return translateFilledNewArray(dex, units, pc, true, strings, typePool, emits);
             }
+            case 0x26: { // fill-array-data → CONST index/value + APUT (no new PVM2 op)
+                return translateFillArrayData(units, pc, scratchReg, scratchReg + 1, totalRegs,
+                        emits);
+            }
             case 0x27: { // throw
                 emits.add(Emit.of(Pvm2Opcodes.OP_THROW, (u0 >> 8) & 0xff));
                 return 1;
+            }
+            case 0x2b: { // packed-switch → CONST + IF_EQ chain (no new PVM2 op)
+                return translatePackedSwitch(units, pc, scratchReg, emits, fixups);
             }
             case 0x28: {
                 int emitIndex = emits.size();
@@ -638,6 +657,269 @@ public final class Pvm2Compiler {
             default:
                 throw new UnsupportedOperationException("unsupported opcode 0x" + Integer.toHexString(op));
         }
+    }
+
+    /**
+     * packed-switch vAA, +BBBBBBBB. Payload ident 0x0100.
+     * Lowered to {@code CONST scratch, key} + {@code IF_EQ vAA, scratch, target} per case;
+     * default is fall-through. Does not add a PVM2 opcode (morph table stays 50).
+     */
+    private static int translatePackedSwitch(short[] units, int pc, int scratchReg,
+                                            List<Emit> emits, List<Fixup> fixups) {
+        if (pc + 3 > units.length) {
+            throw new UnsupportedOperationException("truncated packed-switch");
+        }
+        int vAA = (units[pc] >> 8) & 0xff;
+        int payloadPc = pc + readI32Units(units, pc + 1);
+        if (payloadPc < 0 || payloadPc + 4 > units.length) {
+            throw new UnsupportedOperationException("bad packed-switch payload");
+        }
+        if ((units[payloadPc] & 0xffff) != PACKED_SWITCH_IDENT) {
+            throw new UnsupportedOperationException("bad packed-switch ident");
+        }
+        int size = units[payloadPc + 1] & 0xffff;
+        int firstKey = readI32Units(units, payloadPc + 2);
+        int width = 4 + size * 2;
+        if (payloadPc + width > units.length) {
+            throw new UnsupportedOperationException("truncated packed-switch payload");
+        }
+        for (int i = 0; i < size; i++) {
+            int targetRel = readI32Units(units, payloadPc + 4 + i * 2);
+            int targetPc = pc + targetRel;
+            if (targetPc < 0 || targetPc >= units.length) {
+                throw new UnsupportedOperationException("bad packed-switch target");
+            }
+            int key = firstKey + i;
+            emits.add(Emit.const32(scratchReg, key));
+            int emitIndex = emits.size();
+            emits.add(Emit.ifCmpPlaceholder(Pvm2Opcodes.COND_EQ, vAA, scratchReg));
+            fixups.add(new Fixup(emitIndex, 4, targetPc));
+        }
+        return 3;
+    }
+
+    /**
+     * fill-array-data vAA, +BBBBBBBB. Payload ident 0x0300.
+     * Lowered to {@code CONST idx} + {@code CONST val} + {@code APUT} per element.
+     * Width 1/2/4/8 → byte/short/int/long kinds; interpreter discriminates
+     * boolean/char/float/double by runtime array type. No new PVM2 opcode.
+     */
+    private static int translateFillArrayData(short[] units, int pc, int scratchIdx,
+                                              int scratchVal, int totalRegs, List<Emit> emits) {
+        if (pc + 3 > units.length) {
+            throw new UnsupportedOperationException("truncated fill-array-data");
+        }
+        int vAA = (units[pc] >> 8) & 0xff;
+        int payloadPc = pc + readI32Units(units, pc + 1);
+        if (payloadPc < 0 || payloadPc + 4 > units.length) {
+            throw new UnsupportedOperationException("bad fill-array-data payload");
+        }
+        if ((units[payloadPc] & 0xffff) != FILL_ARRAY_DATA_IDENT) {
+            throw new UnsupportedOperationException("bad fill-array-data ident");
+        }
+        int elemWidth = units[payloadPc + 1] & 0xffff;
+        int size = readI32Units(units, payloadPc + 2);
+        if (size < 0) {
+            throw new UnsupportedOperationException("bad fill-array-data size");
+        }
+        int kind;
+        boolean wide;
+        switch (elemWidth) {
+            case 1:
+                kind = Pvm2Opcodes.KIND_B;
+                wide = false;
+                break;
+            case 2:
+                kind = Pvm2Opcodes.KIND_S;
+                wide = false;
+                break;
+            case 4:
+                kind = Pvm2Opcodes.KIND_I;
+                wide = false;
+                break;
+            case 8:
+                kind = Pvm2Opcodes.KIND_J;
+                wide = true;
+                break;
+            default:
+                throw new UnsupportedOperationException("bad fill-array-data width " + elemWidth);
+        }
+        int need = wide ? scratchVal + 2 : scratchVal + 1;
+        if (need > totalRegs) {
+            throw new UnsupportedOperationException("too many regs (+scratch)");
+        }
+        long dataBytes = (long) size * (long) elemWidth;
+        int dataUnits = (int) ((dataBytes + 1) / 2);
+        if (payloadPc + 4 + dataUnits > units.length) {
+            throw new UnsupportedOperationException("truncated fill-array-data payload");
+        }
+        for (int i = 0; i < size; i++) {
+            emits.add(Emit.const32(scratchIdx, i));
+            int byteOff = i * elemWidth;
+            if (wide) {
+                emits.add(Emit.const64(scratchVal, readPayloadLong(units, payloadPc, byteOff)));
+            } else {
+                int val;
+                if (elemWidth == 1) {
+                    val = (byte) readPayloadByte(units, payloadPc, byteOff);
+                } else if (elemWidth == 2) {
+                    val = (short) (readPayloadByte(units, payloadPc, byteOff)
+                            | (readPayloadByte(units, payloadPc, byteOff + 1) << 8));
+                } else {
+                    val = readPayloadByte(units, payloadPc, byteOff)
+                            | (readPayloadByte(units, payloadPc, byteOff + 1) << 8)
+                            | (readPayloadByte(units, payloadPc, byteOff + 2) << 16)
+                            | (readPayloadByte(units, payloadPc, byteOff + 3) << 24);
+                }
+                emits.add(Emit.const32(scratchVal, val));
+            }
+            emits.add(Emit.aput(scratchVal, vAA, scratchIdx, kind));
+        }
+        return 3;
+    }
+
+    private static int extraRegsForUnits(short[] units) {
+        int extra = 1;
+        int pc = 0;
+        while (pc < units.length) {
+            int u0 = units[pc] & 0xffff;
+            int op = u0 & 0xff;
+            if (op == 0x00 && (u0 == PACKED_SWITCH_IDENT
+                    || u0 == SPARSE_SWITCH_IDENT
+                    || u0 == FILL_ARRAY_DATA_IDENT)) {
+                try {
+                    int w = payloadWidth(units, pc);
+                    pc += Math.max(w, 1);
+                } catch (RuntimeException e) {
+                    pc += 1;
+                }
+                continue;
+            }
+            if (op == 0x26 && pc + 3 <= units.length) {
+                int payloadPc = pc + readI32Units(units, pc + 1);
+                if (payloadPc >= 0 && payloadPc + 4 <= units.length
+                        && (units[payloadPc] & 0xffff) == FILL_ARRAY_DATA_IDENT) {
+                    int elemWidth = units[payloadPc + 1] & 0xffff;
+                    extra = Math.max(extra, elemWidth >= 8 ? 3 : 2);
+                }
+                pc += 3;
+                continue;
+            }
+            int n = dalvikCodeUnits(op);
+            if (pc + n > units.length) {
+                break;
+            }
+            pc += n;
+        }
+        return extra;
+    }
+
+    /**
+     * Dalvik instruction size in code units (payloads handled separately).
+     * Matches the dex instruction list used by ART / smali.
+     */
+    private static int dalvikCodeUnits(int op) {
+        switch (op) {
+            case 0x03: case 0x06: case 0x09: // move/16 family
+            case 0x14: // const
+            case 0x17: // const-wide/32
+            case 0x1b: // const-string/jumbo
+            case 0x2a: // goto/32
+            case 0x24: case 0x25: // filled-new-array
+            case 0x26: case 0x2b: case 0x2c: // fill/switch
+            case 0x6e: case 0x6f: case 0x70: case 0x71: case 0x72:
+            case 0x73:
+            case 0x74: case 0x75: case 0x76: case 0x77: case 0x78:
+            case 0x79: case 0x7a:
+            case 0xfc: case 0xfd: // invoke-custom
+                return 3;
+            case 0x18: // const-wide
+                return 5;
+            case 0xfa: case 0xfb: // invoke-polymorphic
+                return 4;
+            case 0x01: case 0x04: case 0x07:
+            case 0x0a: case 0x0b: case 0x0c: case 0x0d:
+            case 0x0e: case 0x0f: case 0x10: case 0x11:
+            case 0x12: case 0x1d: case 0x1e: case 0x21: case 0x27: case 0x28:
+                return 1;
+            case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f:
+            case 0x80: case 0x81: case 0x82: case 0x83: case 0x84:
+            case 0x85: case 0x86: case 0x87: case 0x88: case 0x89:
+            case 0x8a: case 0x8b: case 0x8c: case 0x8d: case 0x8e: case 0x8f:
+                return 1;
+            default:
+                if (op >= 0xb0 && op <= 0xcf) {
+                    return 1;
+                }
+                if (op <= 0x00) {
+                    return 1;
+                }
+                return 2;
+        }
+    }
+
+    private static int readPayloadByte(short[] units, int payloadPc, int byteIndex) {
+        int unit = units[payloadPc + 4 + (byteIndex / 2)] & 0xffff;
+        if ((byteIndex & 1) == 0) {
+            return unit & 0xff;
+        }
+        return (unit >> 8) & 0xff;
+    }
+
+    private static long readPayloadLong(short[] units, int payloadPc, int byteOff) {
+        long v = 0;
+        for (int b = 0; b < 8; b++) {
+            v |= ((long) readPayloadByte(units, payloadPc, byteOff + b)) << (8 * b);
+        }
+        return v;
+    }
+
+    private static int payloadWidth(short[] units, int pc) {
+        int ident = units[pc] & 0xffff;
+        if (ident == PACKED_SWITCH_IDENT) {
+            if (pc + 2 > units.length) {
+                throw new UnsupportedOperationException("truncated packed-switch payload");
+            }
+            int size = units[pc + 1] & 0xffff;
+            int width = 4 + size * 2;
+            if (pc + width > units.length) {
+                throw new UnsupportedOperationException("truncated packed-switch payload");
+            }
+            return width;
+        }
+        if (ident == SPARSE_SWITCH_IDENT) {
+            if (pc + 2 > units.length) {
+                throw new UnsupportedOperationException("truncated sparse-switch payload");
+            }
+            int size = units[pc + 1] & 0xffff;
+            int width = 2 + size * 4;
+            if (pc + width > units.length) {
+                throw new UnsupportedOperationException("truncated sparse-switch payload");
+            }
+            return width;
+        }
+        if (ident == FILL_ARRAY_DATA_IDENT) {
+            if (pc + 4 > units.length) {
+                throw new UnsupportedOperationException("truncated fill-array-data payload");
+            }
+            int elemWidth = units[pc + 1] & 0xffff;
+            long size = readI32Units(units, pc + 2) & 0xffffffffL;
+            long dataBytes = size * (long) elemWidth;
+            if (elemWidth == 0 || dataBytes > (long) Integer.MAX_VALUE - 8) {
+                throw new UnsupportedOperationException("bad fill-array-data payload");
+            }
+            int dataUnits = (int) ((dataBytes + 1) / 2);
+            int width = 4 + dataUnits;
+            if (pc + width > units.length) {
+                throw new UnsupportedOperationException("truncated fill-array-data payload");
+            }
+            return width;
+        }
+        throw new UnsupportedOperationException("not a payload");
+    }
+
+    private static int readI32Units(short[] units, int index) {
+        return (units[index] & 0xffff) | ((units[index + 1] & 0xffff) << 16);
     }
 
     private static int translateInvoke35(Dex dex, short[] units, int pc, int op,
@@ -1026,7 +1308,8 @@ public final class Pvm2Compiler {
         return fieldPool.size() - 1;
     }
 
-    private static byte[] buildImageV3(int regCount, int insSize, int retKind, Pvm2Morph morph,
+    private static byte[] buildImageV3(int regCount, int extraScratch, int insSize, int retKind,
+                                       Pvm2Morph morph,
                                        List<String> strings,
                                        List<Integer> methodPool,
                                        List<Integer> fieldPool,
@@ -1067,6 +1350,11 @@ public final class Pvm2Compiler {
         for (int idx : typePool) writeU16(out, idx);
         out.writeByte(Pvm2Morph.OP_COUNT);
         out.write(morph.forward);
+        if (extraScratch < 1 || extraScratch > 3) {
+            throw new IOException("bad extraScratch " + extraScratch);
+        }
+        out.writeByte(extraScratch);
+        writeU32(out, morph.immKey);
         for (Handler h : handlers) {
             writeU16(out, h.start);
             writeU16(out, h.end);
@@ -1081,6 +1369,13 @@ public final class Pvm2Compiler {
     private static void writeU16(DataOutputStream out, int v) throws IOException {
         out.writeByte(v & 0xff);
         out.writeByte((v >> 8) & 0xff);
+    }
+
+    private static void writeU32(DataOutputStream out, int v) throws IOException {
+        out.writeByte(v & 0xff);
+        out.writeByte((v >> 8) & 0xff);
+        out.writeByte((v >> 16) & 0xff);
+        out.writeByte((v >> 24) & 0xff);
     }
 
     private static final class Handler {

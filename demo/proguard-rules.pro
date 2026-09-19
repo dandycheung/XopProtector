@@ -10,3 +10,10 @@
     public static int stamp;
     public static native int nativeAddRaw(int, int);
 }
+
+# Lifecycle self-test (DefaultLifecycleObserver bridge methods)
+-keep class com.yqsh.protectordemo.LifecycleProbe { *; }
+-keep class com.yqsh.protectordemo.ComponentCallbackProbeProvider { *; }
+-keepclassmembers class * implements androidx.lifecycle.DefaultLifecycleObserver {
+    <methods>;
+}

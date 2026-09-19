@@ -7,6 +7,7 @@
 | Item | Detail |
 |------|--------|
 | Opt-in | `--enable-res-protect` / `--res-protect` (default **OFF**) |
+| Availability | Desktop ExtraProtect UI collapsed; enable via **packer CLI** only for now |
 | Scope | File-backed `res/**` paths found in `resources.arsc` global string pool |
 | Rewrite | Short paths `res/drawable-xxhdpi/foo.png` → `r/a/b.png` |
 | Arsc | In-place string-pool replace (new path must fit old slot) |

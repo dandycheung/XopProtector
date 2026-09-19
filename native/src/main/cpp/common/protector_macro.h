@@ -35,6 +35,8 @@ inline const char* unobsc(const char* obs, size_t len) {
 // .rodata (SHF_MERGE) and the packer can no longer find a dedicated segment.
 #define SECTION_NAME_BITCODE ".bitcode"
 #define SECTION_NAME_DATA ".data"
+// Writable K_wrap slot. Unique name so LLD will not merge it into .data.
+#define SECTION_NAME_PROTWRAP ".protwrap"
 
 #define SECTION(name) __attribute__((section(name)))
 #define KEEP_SYMBOL __attribute__((visibility("default")))
@@ -50,16 +52,6 @@ inline int get_cache_page_size() {
 #define PROTECTOR_PAGE_MASK (~((get_cache_page_size()) - 1))
 #define PROTECTOR_PAGE_START(addr) ((addr) & (uintptr_t)PROTECTOR_PAGE_MASK)
 
-/** Dynamic symbol holding the 16-byte AES key for .bitcode (rewritten by packer). */
-#define PROTECTOR_AES_SO_KEY_SYMBOL "PROTECTOR_UNKNOWN_DATA"
-/** Dynamic symbol holding the 16-byte AES key for code.bin insns (rewritten by packer). */
-#define PROTECTOR_INSN_KEY_SYMBOL "PROTECTOR_INSN_KEY"
-/** Dynamic symbol holding the 16-byte AES key for encrypted dexes.zip (PDX1). */
-#define PROTECTOR_DEX_KEY_SYMBOL "PROTECTOR_DEX_KEY"
-/** Dynamic symbol holding the 16-byte AES key for PAS1 encrypted assets. */
-#define PROTECTOR_ASSETS_KEY_SYMBOL "PROTECTOR_ASSETS_KEY"
-#define PROTECTOR_RC4_KEY_SYMBOL PROTECTOR_AES_SO_KEY_SYMBOL /* legacy alias */
-
 /** Encrypted dexes.zip magic: 'P''D''X''1' */
 #define PROTECTOR_DEX_MAGIC0 'P'
 #define PROTECTOR_DEX_MAGIC1 'D'
@@ -74,11 +66,3 @@ inline int get_cache_page_size() {
 
 /** HMAC-SHA256 key size for config.json integrity. */
 #define PROTECTOR_HMAC_KEY_SIZE 32
-extern "C" {
-extern uint8_t PROTECTOR_UNKNOWN_DATA[];
-extern uint8_t PROTECTOR_INSN_KEY[16];
-extern uint8_t PROTECTOR_DEX_KEY[16];
-extern uint8_t PROTECTOR_ASSETS_KEY[16];
-/** Per-APK HMAC key (XOR-padded); rewritten by packer. */
-extern uint8_t PROTECTOR_HMAC_KEY[PROTECTOR_HMAC_KEY_SIZE];
-}

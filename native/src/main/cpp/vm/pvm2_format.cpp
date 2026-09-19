@@ -53,6 +53,8 @@ static bool read_index_pool(const uint8_t* data, size_t size, size_t* cursor,
 static void set_identity_map(Pvm2Image* out) {
     out->has_morph = false;
     out->isa_id = 0;
+    out->imm_key = 0;
+    out->scratch_extra = 1;
     for (int i = 0; i < 256; i++) {
         out->inv_map[static_cast<size_t>(i)] = static_cast<uint8_t>(i);
     }
@@ -86,7 +88,8 @@ bool parse_pvm2(const uint8_t* data, size_t size, Pvm2Image* out) {
     uint16_t str_count = read_u16(data + 16);
 
     if (out->version != PVM2_VERSION_V1 && out->version != PVM2_VERSION_V2
-            && out->version != PVM2_VERSION_V3 && out->version != PVM2_VERSION_V4) {
+            && out->version != PVM2_VERSION_V3 && out->version != PVM2_VERSION_V4
+            && out->version != PVM2_VERSION_V5) {
         PLOGE("PVM2 unsupported version %u", out->version);
         return false;
     }
@@ -97,6 +100,11 @@ bool parse_pvm2(const uint8_t* data, size_t size, Pvm2Image* out) {
     if (out->version >= PVM2_VERSION_V3 && out->isa_id >= PVM2_ISA_COUNT) {
         PLOGE("PVM2 bad isa_id %u", out->isa_id);
         return false;
+    }
+    if (out->version < PVM2_VERSION_V2) {
+        out->scratch_extra = 0;
+    } else if (out->version < PVM2_VERSION_V5) {
+        out->scratch_extra = 1;
     }
 
     size_t cursor = 18;
@@ -160,6 +168,21 @@ bool parse_pvm2(const uint8_t* data, size_t size, Pvm2Image* out) {
             }
             cursor += op_count;
             out->has_morph = true;
+            if (out->version >= PVM2_VERSION_V5) {
+                if (cursor + 5 > size) {
+                    PLOGE("PVM2 v5 morph extras truncated");
+                    return false;
+                }
+                out->scratch_extra = data[cursor++];
+                if (out->scratch_extra < 1 || out->scratch_extra > 3) {
+                    PLOGE("PVM2 bad scratch_extra %u", out->scratch_extra);
+                    return false;
+                }
+                int32_t key;
+                memcpy(&key, data + cursor, 4);
+                cursor += 4;
+                out->imm_key = key;
+            }
         }
 
         out->handlers.reserve(out->handler_count);

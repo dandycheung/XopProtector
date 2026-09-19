@@ -1,6 +1,7 @@
 package com.yqsh.protector.shell;
 
 import android.app.Application;
+import android.content.ComponentCallbacks;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
@@ -15,6 +16,8 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -85,11 +88,173 @@ public class ProxyApplication extends Application {
     private boolean realOnCreateCalled;
     private static volatile boolean heartbeatStarted;
 
+    /** Registrations received while this Proxy is still the live Application. */
+    private final List<ActivityLifecycleCallbacks> pendingActivityLifecycleCallbacks = new ArrayList<>();
+    private final List<ComponentCallbacks> pendingComponentCallbacks = new ArrayList<>();
+    private final List<OnProvideAssistDataListener> pendingAssistCallbacks = new ArrayList<>();
+
+    @Override
+    public void registerActivityLifecycleCallbacks(ActivityLifecycleCallbacks callback) {
+        super.registerActivityLifecycleCallbacks(callback);
+        if (callback == null) {
+            return;
+        }
+        synchronized (pendingActivityLifecycleCallbacks) {
+            pendingActivityLifecycleCallbacks.add(callback);
+        }
+    }
+
+    @Override
+    public void unregisterActivityLifecycleCallbacks(ActivityLifecycleCallbacks callback) {
+        super.unregisterActivityLifecycleCallbacks(callback);
+        if (callback == null) {
+            return;
+        }
+        synchronized (pendingActivityLifecycleCallbacks) {
+            pendingActivityLifecycleCallbacks.remove(callback);
+        }
+    }
+
+    @Override
+    public void registerComponentCallbacks(ComponentCallbacks callback) {
+        super.registerComponentCallbacks(callback);
+        if (callback == null) {
+            return;
+        }
+        synchronized (pendingComponentCallbacks) {
+            pendingComponentCallbacks.add(callback);
+        }
+    }
+
+    @Override
+    public void unregisterComponentCallbacks(ComponentCallbacks callback) {
+        super.unregisterComponentCallbacks(callback);
+        if (callback == null) {
+            return;
+        }
+        synchronized (pendingComponentCallbacks) {
+            pendingComponentCallbacks.remove(callback);
+        }
+    }
+
+    @Override
+    public void registerOnProvideAssistDataListener(OnProvideAssistDataListener callback) {
+        super.registerOnProvideAssistDataListener(callback);
+        if (callback == null) {
+            return;
+        }
+        synchronized (pendingAssistCallbacks) {
+            pendingAssistCallbacks.add(callback);
+        }
+    }
+
+    @Override
+    public void unregisterOnProvideAssistDataListener(OnProvideAssistDataListener callback) {
+        super.unregisterOnProvideAssistDataListener(callback);
+        if (callback == null) {
+            return;
+        }
+        synchronized (pendingAssistCallbacks) {
+            pendingAssistCallbacks.remove(callback);
+        }
+    }
+
+    /**
+     * Move callbacks registered on this Proxy onto {@code real} via public APIs
+     * (works when hidden-API reflection to {@code mCallbacksController} is blocked).
+     */
+    void transferCallbacksTo(Application real) {
+        if (real == null || real == this) {
+            return;
+        }
+        transferActivityLifecycle(real);
+        transferComponentCallbacks(real);
+        transferAssistCallbacks(real);
+    }
+
+    private void transferActivityLifecycle(Application real) {
+        List<ActivityLifecycleCallbacks> moved;
+        synchronized (pendingActivityLifecycleCallbacks) {
+            if (pendingActivityLifecycleCallbacks.isEmpty()) {
+                return;
+            }
+            moved = new ArrayList<>(pendingActivityLifecycleCallbacks);
+            pendingActivityLifecycleCallbacks.clear();
+        }
+        int added = 0;
+        for (ActivityLifecycleCallbacks cb : moved) {
+            try {
+                unregisterActivityLifecycleCallbacks(cb);
+            } catch (Throwable ignored) {
+            }
+            try {
+                real.registerActivityLifecycleCallbacks(cb);
+                added++;
+            } catch (Throwable t) {
+                Log.w(TAG, "transfer ActivityLifecycleCallbacks failed", t);
+            }
+        }
+        Log.i(TAG, "transferred ActivityLifecycleCallbacks count=" + added
+                + " to=" + real.getClass().getName());
+    }
+
+    private void transferComponentCallbacks(Application real) {
+        List<ComponentCallbacks> moved;
+        synchronized (pendingComponentCallbacks) {
+            if (pendingComponentCallbacks.isEmpty()) {
+                return;
+            }
+            moved = new ArrayList<>(pendingComponentCallbacks);
+            pendingComponentCallbacks.clear();
+        }
+        int added = 0;
+        for (ComponentCallbacks cb : moved) {
+            try {
+                unregisterComponentCallbacks(cb);
+            } catch (Throwable ignored) {
+            }
+            try {
+                real.registerComponentCallbacks(cb);
+                added++;
+            } catch (Throwable t) {
+                Log.w(TAG, "transfer ComponentCallbacks failed", t);
+            }
+        }
+        Log.i(TAG, "transferred ComponentCallbacks count=" + added
+                + " to=" + real.getClass().getName());
+    }
+
+    private void transferAssistCallbacks(Application real) {
+        List<OnProvideAssistDataListener> moved;
+        synchronized (pendingAssistCallbacks) {
+            if (pendingAssistCallbacks.isEmpty()) {
+                return;
+            }
+            moved = new ArrayList<>(pendingAssistCallbacks);
+            pendingAssistCallbacks.clear();
+        }
+        int added = 0;
+        for (OnProvideAssistDataListener cb : moved) {
+            try {
+                unregisterOnProvideAssistDataListener(cb);
+            } catch (Throwable ignored) {
+            }
+            try {
+                real.registerOnProvideAssistDataListener(cb);
+                added++;
+            } catch (Throwable t) {
+                Log.w(TAG, "transfer AssistCallbacks failed", t);
+            }
+        }
+        Log.i(TAG, "transferred AssistCallbacks count=" + added
+                + " to=" + real.getClass().getName());
+    }
+
     @Override
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
         try {
-            bootstrap(base);
+            bootstrap(base, this);
             classLoaderReady = true;
             realApplicationName = safe(JniBridge.readApplicationName());
             Log.i(TAG, "shell init done, realApp=" + realApplicationName);
@@ -107,7 +272,8 @@ public class ProxyApplication extends Application {
     }
 
     /** Shared bootstrap used by Application and AppComponentFactory. */
-    public static void bootstrap(Context context) throws Exception {
+    public static void bootstrap(Context context, Application shell) throws Exception {
+        HiddenApiBypass.exemptAll();
         if (!hasProtectionAssets(context)) {
             Log.i(TAG, "no protection assets, skip shell init");
             return;
@@ -119,7 +285,7 @@ public class ProxyApplication extends Application {
         if (Build.VERSION.SDK_INT >= 28 && ProxyComponentFactory.isBootstrapped()) {
             NativeLibDirRedirect.apply(context, dir);
             JniBridge.verifySignature(context);
-            startHeartbeat();
+            startHeartbeat(shell);
             try {
                 NetGuard.install(context);
             } catch (Throwable t) {
@@ -139,7 +305,11 @@ public class ProxyApplication extends Application {
         if (packagedLib != null) {
             JniBridge.setNativeLibraryDir(packagedLib);
         }
-        JniBridge.initApp(dir.getAbsolutePath());
+        String pkg = context.getPackageName();
+        String apkPath = ai != null ? ai.sourceDir : null;
+        JniBridge.initApp(dir.getAbsolutePath(), pkg, apkPath);
+        // Ping before DexMerger / SO decrypt — init_app already armed the timer.
+        startHeartbeat(shell);
         NativeLibDirRedirect.apply(context, dir);
         DexMerger.merge(context.getClassLoader(), dir);
         // API≤24 x86: defer SO preload — L2/L3 verneed is flaky; ensureBusinessSo decrypts later.
@@ -150,7 +320,6 @@ public class ProxyApplication extends Application {
         }
         JniBridge.enableJunkVerify();
         JniBridge.verifySignature(context);
-        startHeartbeat();
         try {
             NetGuard.install(context);
         } catch (Throwable t) {
@@ -163,16 +332,25 @@ public class ProxyApplication extends Application {
         }
     }
 
+    /** ACF: start pings as soon as the shell Application exists (after FileBootstrap). */
+    static void onShellInstantiated(Application app) {
+        if (app instanceof ProxyApplication) {
+            startHeartbeat(app);
+        }
+    }
+
     /** Periodic Java→Native heartbeat so the native risk thread
-     *  can detect Java-layer tampering (e.g. ProxyApplication swapped). */
-    private static void startHeartbeat() {
+     *  can detect Java-layer tampering. Pass the live {@code ProxyApplication}
+     *  ({@code this} in {@link #attachBaseContext}); do not use
+     *  {@code ActivityThread.currentApplication()} after replace. */
+    private static void startHeartbeat(Application shell) {
         if (heartbeatStarted) return;
         heartbeatStarted = true;
         Thread t = new Thread(() -> {
             while (true) {
                 try {
+                    JniBridge.heartbeat(shell);
                     Thread.sleep(5000);
-                    JniBridge.heartbeat();
                 } catch (Throwable ignored) {
                     // If heartbeat fails the native side will notice the
                     // missing ping and crash the process itself.
@@ -232,7 +410,7 @@ public class ProxyApplication extends Application {
                 // Outer LoadedApk.makeApplication overwrote mApplication /
                 // mInitialApplication back to this Proxy after early replace.
                 // Re-pin so Activity.getApplication() is the real Application.
-                ApplicationReplacer.reattach(realApplication);
+                ApplicationReplacer.reattach(realApplication, this);
             }
             if (invokeOnCreate && realApplication != null && !realOnCreateCalled) {
                 // Providers already ran under the replaced Application. Clear the
@@ -269,7 +447,7 @@ public class ProxyApplication extends Application {
             return;
         }
         try {
-            ApplicationReplacer.reattach(business);
+            ApplicationReplacer.reattach(business, this);
             realApplication = business;
             business.onCreate();
             Log.i(TAG, "business Application.onCreate called: " + business.getClass().getName());
@@ -316,6 +494,7 @@ public class ProxyApplication extends Application {
         invalidateIfApkChanged(outDir, new File(info.sourceDir));
 
         File outZip = new File(outDir, DEXES_ZIP);
+        // Warm: reuse prepatched classes*.dex; skip re-copying PDX1/dexes.zip.
         boolean warm = DexMerger.hasWarmCache(outDir);
         if (!warm && !(outZip.exists() && outZip.length() > 0)) {
             try (ZipFile apk = new ZipFile(info.sourceDir)) {
@@ -369,9 +548,11 @@ public class ProxyApplication extends Application {
         // rewrite when classes*.dex already exists with non-zero length.
         deleteExtractedDexes(outDir);
         deleteQuietly(new File(outDir, ".prepatched"));
+        deleteQuietly(new File(new File(outDir, "so_plain"), "so_plain_ready"));
         deleteQuietly(new File(outDir, "dex_bundle.zip")); // legacy from brief experiment
         deleteDir(new File(outDir, "so_plain"));
         deleteDir(new File(outDir, "so_cipher"));
+        deleteDir(new File(outDir, "so_warm"));
         deleteQuietly(stampFile);
         Log.i(TAG, "protector cache invalidated for new APK");
     }

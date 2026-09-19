@@ -11,8 +11,11 @@ public final class JniBridge {
     private JniBridge() {
     }
 
-    /** Initialize runtime with extracted protector directory absolute path. */
-    public static native void initApp(String protectorDir);
+    /**
+     * Initialize runtime with extracted protector directory, app package, and
+     * base APK path ({@code ApplicationInfo.sourceDir}) for native v2/v3 cert parse.
+     */
+    public static native void initApp(String protectorDir, String packageName, String apkPath);
 
     /** ApplicationInfo.nativeLibraryDir — used to resolve basename loadLibrary paths. */
     public static native void setNativeLibraryDir(String nativeLibraryDir);
@@ -35,12 +38,15 @@ public final class JniBridge {
     /** Native version / probe for debug. */
     public static native String nativeVersion();
 
-    /** Verify APK signing certificate SHA-256 against config.app_sign_sha256. */
+    /** Verify APK v2/v3 first-signer cert SHA-256 against config.app_sign_sha256. */
     public static native void verifySignature(android.content.Context context);
 
-    /** Java→Native heartbeat.  Call periodically (~5 s).  If calls stop
-     *  for > 15 s the native risk thread will kill the process. */
-    public static native void heartbeat();
+    /** Java→Native heartbeat. Call periodically (~5 s) from
+     *  {@link ProxyApplication} with the live shell instance. Native rejects
+     *  pings that are not {@code JniBridge} + {@code ProxyApplication}.
+     *  After {@code init_app}, the first ping must arrive within 90 s; afterwards
+     *  a gap &gt; 15 s kills the process. */
+    public static native void heartbeat(android.app.Application shell);
 
     /**
      * True when rasp_action=Degrade and a detector fired.

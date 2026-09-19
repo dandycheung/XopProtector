@@ -1,19 +1,27 @@
 package com.yqsh.protector.packer.util;
 
 import java.security.SecureRandom;
+import java.util.Arrays;
 import javax.crypto.Cipher;
+import javax.crypto.Mac;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * Crypto helpers shared by packer and matching native crypto/aes.*.
- * AES-128-GCM for code.bin method bodies; AES-128-CTR (zero IV) for SO sections.
+ * Crypto helpers shared by packer and matching native crypto/aes.* / sha256.*.
+ * AES-128-GCM for code.bin method bodies; AES-128-CTR (zero IV) for SO sections;
+ * HKDF-SHA256 (RFC 5869) for the key ladder (must match native
+ * {@code protector::crypto::hkdf_sha256}).
  */
 public final class CryptoUtils {
     public static final int AES_KEY_LEN = 16;
     public static final int GCM_NONCE_LEN = 12;
     public static final int GCM_TAG_LEN = 16;
+    /** SHA-256 / HMAC-SHA256 output length. */
+    public static final int SHA256_LEN = 32;
+    /** RFC 5869: N = ceil(L / HashLen) must be &lt;= 255. */
+    public static final int HKDF_MAX_OUT_LEN = 255 * SHA256_LEN;
 
     private CryptoUtils() {
     }
@@ -88,5 +96,70 @@ public final class CryptoUtils {
             sb.append(String.format("%02x", b & 0xff));
         }
         return sb.toString();
+    }
+
+    /**
+     * HMAC-SHA256. Empty {@code data} is allowed (RFC 2104).
+     */
+    public static byte[] hmacSha256(byte[] key, byte[] data) {
+        if (key == null || key.length == 0) {
+            throw new IllegalArgumentException("HMAC key required");
+        }
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(data != null ? data : new byte[0]);
+        } catch (Exception e) {
+            throw new IllegalStateException("HmacSHA256 unavailable", e);
+        }
+    }
+
+    /**
+     * HKDF-SHA256 (RFC 5869 Extract-then-Expand).
+     * {@code salt == null} or empty → HashLen zero bytes (RFC default).
+     * {@code info == null} → empty info.
+     */
+    public static byte[] hkdfSha256(byte[] ikm, byte[] salt, byte[] info, int outLen) {
+        if (ikm == null) {
+            throw new IllegalArgumentException("HKDF IKM required");
+        }
+        if (outLen <= 0 || outLen > HKDF_MAX_OUT_LEN) {
+            throw new IllegalArgumentException("HKDF outLen out of range: " + outLen);
+        }
+        byte[] saltKey = (salt == null || salt.length == 0)
+                ? new byte[SHA256_LEN]
+                : salt;
+        byte[] prk = hmacSha256(saltKey, ikm);
+        try {
+            return hkdfExpand(prk, info != null ? info : new byte[0], outLen);
+        } finally {
+            Arrays.fill(prk, (byte) 0);
+            if (salt == null || salt.length == 0) {
+                Arrays.fill(saltKey, (byte) 0);
+            }
+        }
+    }
+
+    private static byte[] hkdfExpand(byte[] prk, byte[] info, int outLen) {
+        int n = (outLen + SHA256_LEN - 1) / SHA256_LEN;
+        byte[] okm = new byte[outLen];
+        byte[] t = new byte[0];
+        int filled = 0;
+        try {
+            for (int i = 1; i <= n; i++) {
+                byte[] block = new byte[t.length + info.length + 1];
+                System.arraycopy(t, 0, block, 0, t.length);
+                System.arraycopy(info, 0, block, t.length, info.length);
+                block[block.length - 1] = (byte) i;
+                t = hmacSha256(prk, block);
+                Arrays.fill(block, (byte) 0);
+                int copy = Math.min(SHA256_LEN, outLen - filled);
+                System.arraycopy(t, 0, okm, filled, copy);
+                filled += copy;
+            }
+            return okm;
+        } finally {
+            Arrays.fill(t, (byte) 0);
+        }
     }
 }

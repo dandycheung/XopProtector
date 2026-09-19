@@ -33,6 +33,7 @@
 #if defined(__ANDROID__)
 #include <android/api-level.h>
 #include <android/dlext.h>
+#include <sys/sendfile.h>
 #endif
 
 namespace protector::so {
@@ -54,10 +55,15 @@ static std::atomic_bool g_hooks_installed{false};
 static std::atomic_bool g_dlopen_hooks_ok{false};
 /** Process-local: full keyed materialize already completed successfully. */
 static std::atomic_bool g_full_materialize_done{false};
+/** Dropped leftover so_plain_ready / keyed mirrors from a previous process. */
+static std::atomic_bool g_dropped_stale_mirrors{false};
 
 static bool dlopen_hooks_ok() {
     return g_dlopen_hooks_ok.load(std::memory_order_acquire);
 }
+
+/** True after L1/L2 mapped plaintext for this keyed basename (skip in-memory RC4). */
+static bool keyed_mapped_plain(const std::string& base);
 
 /** Full keyed materialize into so_plain (eager path). Used by eager mode and as
  *  lazy fallback when dlopen hooks are unavailable (e.g. bytehook INITERR_SIG). */
@@ -70,6 +76,28 @@ static std::string g_native_lib_dir;
 static std::atomic<int> g_so_decrypt_mode{static_cast<int>(SoDecryptMode::Eager)};
 
 static constexpr const char* kSoPlainReady = "so_plain_ready";
+static constexpr const char* kSoWarmDir = "so_warm";
+static constexpr const char* kSoWarmReady = "so_warm_ready";
+static constexpr uint8_t kPsw1Magic[4] = {'P', 'S', 'W', '1'};
+/** Skip encrypting / hydrating blobs larger than this (avoid peak RAM). */
+static constexpr off_t kWarmMaxPlainBytes = 64 * 1024 * 1024;
+
+static uint8_t g_so_warm_key[16]{};
+static std::atomic_bool g_so_warm_key_set{false};
+
+void set_so_warm_key(const uint8_t key[16]) {
+    if (key == nullptr) {
+        g_so_warm_key_set.store(false, std::memory_order_release);
+        memset(g_so_warm_key, 0, sizeof(g_so_warm_key));
+        return;
+    }
+    memcpy(g_so_warm_key, key, 16);
+    g_so_warm_key_set.store(true, std::memory_order_release);
+}
+
+static bool so_warm_key_ok() {
+    return g_so_warm_key_set.load(std::memory_order_acquire);
+}
 
 void set_runtime_dirs(const std::string& protector_dir, const std::string& native_lib_dir) {
     std::lock_guard<std::mutex> lock(g_mu);
@@ -129,8 +157,8 @@ static std::string basename_of(const char* path) {
     return std::string(base);
 }
 
-bool load_sokeys(const std::string& path, const uint8_t* dex_aes_key) {
-    if (dex_aes_key == nullptr) return false;
+bool load_sokeys(const std::string& path, const uint8_t* so_wrap_key) {
+    if (so_wrap_key == nullptr) return false;
     std::vector<uint8_t> buf;
     if (!read_file(path, buf) || buf.size() < 4) {
         PLOGI("sokeys.bin absent — business SO protect off");
@@ -145,7 +173,7 @@ bool load_sokeys(const std::string& path, const uint8_t* dex_aes_key) {
     if (enc_len < crypto::GCM_NONCE_LEN + crypto::GCM_TAG_LEN) return false;
     size_t plain_len = enc_len - crypto::GCM_NONCE_LEN - crypto::GCM_TAG_LEN;
     std::vector<uint8_t> plain(plain_len);
-    if (!crypto::aes128_gcm_decrypt(dex_aes_key, enc, enc_len, plain.data(), plain_len)) {
+    if (!crypto::aes128_gcm_decrypt(so_wrap_key, enc, enc_len, plain.data(), plain_len)) {
         PLOGE("sokeys AES-GCM decrypt failed");
         return false;
     }
@@ -285,6 +313,11 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
     ClaimResult claim = claim_key(so_name, key_bytes);
     if (claim == ClaimResult::NotProtected) return true;
 
+    // L1 / L2-memfd / L2-fd already mapped plaintext — never RC4 the image again.
+    if (claim == ClaimResult::AlreadyDone && keyed_mapped_plain(so_name)) {
+        return true;
+    }
+
     // Prefer packaged extract mapping when present: so_plain may also appear in
     // maps while the JNI entry still points at ciphertext (API≤23 L2/L3 fallback).
     std::string path;
@@ -305,10 +338,15 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
 #else
                 if (sscanf(line, "%*x-%*x %*s %*x %*s %*s %255s", map_path) != 1) continue;
 #endif
+                const bool memfd = strstr(map_path, "/memfd:") != nullptr;
                 const char* base = strrchr(map_path, '/');
                 base = base ? base + 1 : map_path;
-                if (strcmp(base, so_name.c_str()) != 0) continue;
-                if (strstr(map_path, "/so_plain/") != nullptr) {
+                bool name_hit = strcmp(base, so_name.c_str()) == 0;
+                if (!name_hit && memfd && strncmp(base, "memfd:", 6) == 0) {
+                    name_hit = strcmp(base + 6, so_name.c_str()) == 0;
+                }
+                if (!name_hit) continue;
+                if (memfd || strstr(map_path, "/so_plain/") != nullptr) {
                     if (plain_hit.empty()) plain_hit = map_path;
                 } else if (pkg_hit.empty()) {
                     pkg_hit = map_path;
@@ -582,11 +620,14 @@ static int scrub_forbidden_from_so_plain(const std::string& out_dir);
 
 /**
  * L1/L2/L3 keyed open plan (docs/so-load-contract.md).
- * L2: linker filename = extract path (dladdr), content = so_plain via LIBRARY_FD.
+ * L2: linker filename = extract path (dladdr); content = memfd (optional) or
+ * so_plain via LIBRARY_FD. L3 keeps the so_plain path as fallback.
  */
 struct KeyedOpenPlan {
+    std::string base;
     std::string linker_name;
     std::string content_path;
+    std::string so_plain_path;
     bool use_library_fd = false;
 };
 
@@ -595,6 +636,124 @@ static int g_extract_writable = -1; // -1 unknown, 0 no, 1 yes
 /** L2b: stable extract paths for dladdr rewrite (keyed basename → extract abs). */
 static std::mutex g_dladdr_mu;
 static std::unordered_map<std::string, std::string> g_dladdr_extract;
+/** Keyed SOs already mapped from plaintext (L1 / L2 fd / memfd) — skip in-memory RC4. */
+static std::unordered_set<std::string> g_fd_mapped_plain;
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+/** Skip memfd copy for huge SOs (path-sensitive megacores); L2 file fd still applies. */
+static constexpr off_t kMemfdMaxBytes = 16 * 1024 * 1024;
+
+/**
+ * Copy {@code path} into an anonymous memfd. Returns -1 if unsupported, too
+ * large, or copy failed — caller then opens so_plain as the L2 fd.
+ */
+static int create_memfd_from_path(const std::string& path, const char* name) {
+#if defined(__ANDROID__) && defined(__NR_memfd_create)
+    int src = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (src < 0) return -1;
+    struct stat st {};
+    if (fstat(src, &st) != 0 || st.st_size <= 0 || st.st_size > kMemfdMaxBytes) {
+        close(src);
+        return -1;
+    }
+    const char* tag = (name != nullptr && name[0] != '\0') ? name : "xopso";
+    int mfd = static_cast<int>(syscall(__NR_memfd_create, tag, MFD_CLOEXEC));
+    if (mfd < 0) {
+        close(src);
+        return -1;
+    }
+    off_t copied = 0;
+    while (copied < st.st_size) {
+        off_t off = copied;
+        ssize_t n = sendfile(mfd, src, &off, static_cast<size_t>(st.st_size - copied));
+        if (n <= 0) break;
+        copied = off;
+    }
+    if (copied != st.st_size) {
+        if (lseek(src, copied, SEEK_SET) < 0 || lseek(mfd, copied, SEEK_SET) < 0) {
+            close(src);
+            close(mfd);
+            return -1;
+        }
+        char buf[256 * 1024];
+        off_t left = st.st_size - copied;
+        while (left > 0) {
+            size_t want = sizeof(buf) < static_cast<size_t>(left)
+                    ? sizeof(buf) : static_cast<size_t>(left);
+            ssize_t r = read(src, buf, want);
+            if (r <= 0) {
+                close(src);
+                close(mfd);
+                return -1;
+            }
+            ssize_t w = 0;
+            while (w < r) {
+                ssize_t k = write(mfd, buf + w, static_cast<size_t>(r - w));
+                if (k <= 0) {
+                    close(src);
+                    close(mfd);
+                    return -1;
+                }
+                w += k;
+            }
+            left -= r;
+        }
+    }
+    close(src);
+    if (lseek(mfd, 0, SEEK_SET) != 0) {
+        close(mfd);
+        return -1;
+    }
+    return mfd;
+#else
+    (void)path;
+    (void)name;
+    return -1;
+#endif
+}
+
+static void mark_keyed_mapped_plain(const std::string& base) {
+    if (base.empty()) return;
+    std::lock_guard<std::mutex> lock(g_dladdr_mu);
+    g_fd_mapped_plain.insert(base);
+}
+
+static void unmark_keyed_mapped_plain(const std::string& base) {
+    if (base.empty()) return;
+    std::lock_guard<std::mutex> lock(g_dladdr_mu);
+    g_fd_mapped_plain.erase(base);
+}
+
+static bool keyed_mapped_plain(const std::string& base) {
+    if (base.empty()) return false;
+    std::lock_guard<std::mutex> lock(g_dladdr_mu);
+    return g_fd_mapped_plain.count(base) != 0;
+}
+
+/**
+ * Intentionally a no-op under plaintext warm reuse: so_plain mirrors must
+ * survive L1/L2 maps so the next process can skip RC4 via so_plain_ready.
+ * (PR12 in-process unlink conflicted with cross-launch warm; product chose speed.)
+ */
+static void maybe_drop_so_plain_mirror(const KeyedOpenPlan& plan) {
+    (void)plan;
+}
+
+static std::string keyed_soname_from_fname(const char* fname) {
+    if (fname == nullptr || fname[0] == '\0') return {};
+    const char* memfd = strstr(fname, "/memfd:");
+    if (memfd != nullptr) {
+        memfd += 7;
+        const char* end = memfd;
+        while (*end != '\0' && *end != ' ' && *end != ')') {
+            ++end;
+        }
+        return std::string(memfd, static_cast<size_t>(end - memfd));
+    }
+    return basename_of(fname);
+}
 
 static bool extract_dir_writable(const std::string& nld) {
     if (nld.empty()) return false;
@@ -627,8 +786,10 @@ static std::string keyed_packaged_src(const std::string& name, const std::string
 
 static KeyedOpenPlan plan_keyed_open(const std::string& base, const std::string& plain_path) {
     KeyedOpenPlan plan;
+    plan.base = base;
     plan.content_path = plain_path;
     plan.linker_name = plain_path;
+    plan.so_plain_path = plain_path;
     plan.use_library_fd = false;
     if (base.empty() || plain_path.empty() || !file_exists_path(plain_path)) {
         return plan;
@@ -669,7 +830,7 @@ static KeyedOpenPlan plan_keyed_open(const std::string& base, const std::string&
             PLOGW("business so: L1 publish failed %s — trying L2", base.c_str());
         }
     }
-    // L2: name=extract (dladdr), content=so_plain via android_dlopen_ext LIBRARY_FD.
+    // L2: name=extract (dladdr), content=memfd (optional) or so_plain via LIBRARY_FD.
     plan.linker_name = extract;
     plan.content_path = plain_path;
     plan.use_library_fd = true;
@@ -677,7 +838,7 @@ static KeyedOpenPlan plan_keyed_open(const std::string& base, const std::string&
         std::lock_guard<std::mutex> lock(g_dladdr_mu);
         g_dladdr_extract[base] = extract;
     }
-    PLOGI("business so: load L2 extract-name + so_plain fd %s", base.c_str());
+    PLOGI("business so: load L2 extract-name + LIBRARY_FD %s", base.c_str());
     return plan;
 }
 
@@ -712,7 +873,13 @@ static void* dlopen_keyed_plan(const KeyedOpenPlan& plan, int flags,
     if (plan.use_library_fd) {
         AndroidDlopenExtFn ext = resolve_android_dlopen_ext();
         if (ext != nullptr) {
-            int fd = open(plan.content_path.c_str(), O_RDONLY | O_CLOEXEC);
+            bool used_memfd = false;
+            int fd = create_memfd_from_path(plan.content_path, plan.base.c_str());
+            if (fd >= 0) {
+                used_memfd = true;
+            } else {
+                fd = open(plan.content_path.c_str(), O_RDONLY | O_CLOEXEC);
+            }
             if (fd >= 0) {
                 android_dlextinfo info{};
                 // Preserve only namespace from caller. Do NOT copy USE_LIBRARY_FD(_OFFSET)
@@ -729,11 +896,18 @@ static void* dlopen_keyed_plan(const KeyedOpenPlan& plan, int flags,
                 info.flags |= ANDROID_DLEXT_USE_LIBRARY_FD;
                 info.library_fd = fd;
                 info.library_fd_offset = 0;
+                // Mark before ext() so .init_array / JNI_OnLoad skip in-memory RC4.
+                mark_keyed_mapped_plain(plan.base);
                 void* h = ext(plan.linker_name.c_str(), flags, &info);
                 close(fd);
                 if (h != nullptr) {
+                    maybe_drop_so_plain_mirror(plan);
+                    if (used_memfd) {
+                        PLOGI("business so: L2 content=memfd %s", plan.base.c_str());
+                    }
                     return h;
                 }
+                unmark_keyed_mapped_plain(plan.base);
                 __android_log_print(ANDROID_LOG_WARN, "protector.SoLoad",
                         "L2 fail %s err=%s — L3", plan.linker_name.c_str(),
                         dlerror());
@@ -745,13 +919,23 @@ static void* dlopen_keyed_plan(const KeyedOpenPlan& plan, int flags,
             __android_log_print(ANDROID_LOG_WARN, "protector.SoLoad",
                     "L2 no android_dlopen_ext — L3");
         }
-        // Fall through to L3 direct so_plain dlopen.
+        // Fall through to L3 direct so_plain dlopen — keep the file.
         return dlopen(plan.content_path.c_str(), flags);
     }
 #else
     (void)caller_extinfo;
 #endif
-    return dlopen(plan.content_path.c_str(), flags);
+    mark_keyed_mapped_plain(plan.base);
+    void* h = dlopen(plan.content_path.c_str(), flags);
+    if (h != nullptr) {
+        // L1: extract holds plaintext; drop the so_plain duplicate. L3 (no nld): keep.
+        if (plan.content_path != plan.so_plain_path) {
+            maybe_drop_so_plain_mirror(plan);
+        }
+        return h;
+    }
+    unmark_keyed_mapped_plain(plan.base);
+    return nullptr;
 }
 
 static bool file_exists_path(const std::string& path);
@@ -763,6 +947,10 @@ static off_t file_size_path(const std::string& path) {
     struct stat st {};
     if (stat(path.c_str(), &st) != 0) return -1;
     return st.st_size;
+}
+
+static void drop_so_plain_ready(const std::string& out_dir) {
+    unlink((out_dir + "/" + kSoPlainReady).c_str());
 }
 
 static bool write_so_plain_ready(const std::string& out_dir, size_t count) {
@@ -780,8 +968,8 @@ static bool write_so_plain_ready(const std::string& out_dir, size_t count) {
 
 /** True when so_plain_ready exists and every keyed SO that exists in nld is mirrored. */
 static bool so_plain_ready_ok(const std::string& out_dir,
-                             const std::string& nld,
-                             const std::vector<std::string>& names) {
+                              const std::string& nld,
+                              const std::vector<std::string>& names) {
     if (!file_exists_path(out_dir + "/" + kSoPlainReady)) return false;
     if (names.empty()) return false;
     for (const auto& name : names) {
@@ -793,6 +981,303 @@ static bool so_plain_ready_ok(const std::string& out_dir,
         if (ds <= 0 || ss <= 0 || ds != ss) return false;
     }
     return true;
+}
+
+/**
+ * Discard leftover keyed mirrors was used when product refused cross-launch
+ * plaintext. Plaintext warm restores reuse instead — keep this helper unused
+ * (APK stamp still deletes so_plain/ on update).
+ */
+static void drop_cross_launch_so_plain(const std::string& out_dir,
+                                       const std::vector<std::string>& names) {
+    (void)out_dir;
+    (void)names;
+    // no-op: plaintext warm keeps so_plain across launches
+}
+
+static std::string so_warm_dir(const std::string& cache_root) {
+    return cache_root + "/" + kSoWarmDir;
+}
+
+static std::string so_warm_blob_path(const std::string& warm_dir, const std::string& name) {
+    return warm_dir + "/" + name + ".w1";
+}
+
+static bool read_all_file(const std::string& path, std::vector<uint8_t>* out) {
+    if (out == nullptr) return false;
+    out->clear();
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (fp == nullptr) return false;
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return false;
+    }
+    long sz = ftell(fp);
+    if (sz < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return false;
+    }
+    out->resize(static_cast<size_t>(sz));
+    size_t n = out->empty() ? 0 : fread(out->data(), 1, out->size(), fp);
+    fclose(fp);
+    if (n != out->size()) {
+        out->clear();
+        return false;
+    }
+    return true;
+}
+
+static bool write_all_file_atomic(const std::string& path, const uint8_t* data, size_t len) {
+    if (data == nullptr && len != 0) return false;
+    std::string tmp = path + ".tmp";
+    unlink(tmp.c_str());
+    FILE* fp = fopen(tmp.c_str(), "wb");
+    if (fp == nullptr) return false;
+    bool ok = len == 0 || fwrite(data, 1, len, fp) == len;
+    if (ok) {
+        fflush(fp);
+#if defined(__ANDROID__)
+        fsync(fileno(fp));
+#endif
+    }
+    fclose(fp);
+    if (!ok) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    chmod(tmp.c_str(), 0600);
+    unlink(path.c_str());
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool random_nonce12(uint8_t out[12]) {
+    if (out == nullptr) return false;
+#if defined(__ANDROID__)
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    size_t got = 0;
+    while (got < 12) {
+        ssize_t n = read(fd, out + got, 12 - got);
+        if (n <= 0) {
+            close(fd);
+            return false;
+        }
+        got += static_cast<size_t>(n);
+    }
+    close(fd);
+    return true;
+#else
+    for (int i = 0; i < 12; i++) out[i] = static_cast<uint8_t>(i + 1);
+    return true;
+#endif
+}
+
+/**
+ * Decrypt PSW1 blob → so_plain/name (ephemeral plaintext for this process).
+ * @return true on success or SO not present in warm (caller falls back).
+ *         false only when blob exists but is corrupt / auth fails.
+ */
+static bool try_hydrate_one_from_warm(const std::string& name,
+                                      const std::string& warm_dir,
+                                      const std::string& plain_dir,
+                                      const std::string& nld) {
+    if (!so_warm_key_ok() || name.empty() || is_system_soname(name)) return true;
+    std::string src = keyed_packaged_src(name, nld);
+    if (!file_exists_path(src)) {
+        // Other-ABI-only entry.
+        std::lock_guard<std::mutex> lock(g_mu);
+        SoKey* key = find_key_unlocked(name);
+        if (key != nullptr) {
+            key->decrypted = true;
+            key->in_flight = false;
+            g_cv.notify_all();
+        }
+        return true;
+    }
+    off_t expect = file_size_path(src);
+    if (expect <= 0 || expect > kWarmMaxPlainBytes) return true;
+
+    std::string blob = so_warm_blob_path(warm_dir, name);
+    std::vector<uint8_t> pkg;
+    if (!read_all_file(blob, &pkg)) return true; // miss → cold path
+    if (pkg.size() < 4 + 4 + crypto::GCM_NONCE_LEN + crypto::GCM_TAG_LEN) {
+        unlink(blob.c_str());
+        return false;
+    }
+    if (memcmp(pkg.data(), kPsw1Magic, 4) != 0) {
+        unlink(blob.c_str());
+        return false;
+    }
+    uint32_t plain_size = static_cast<uint32_t>(pkg[4])
+            | (static_cast<uint32_t>(pkg[5]) << 8)
+            | (static_cast<uint32_t>(pkg[6]) << 16)
+            | (static_cast<uint32_t>(pkg[7]) << 24);
+    if (static_cast<off_t>(plain_size) != expect
+            || pkg.size() != 8 + crypto::GCM_NONCE_LEN + plain_size + crypto::GCM_TAG_LEN) {
+        unlink(blob.c_str());
+        return false;
+    }
+    std::vector<uint8_t> plain(plain_size);
+    const uint8_t* gcm = pkg.data() + 8;
+    size_t gcm_len = pkg.size() - 8;
+    if (!crypto::aes128_gcm_decrypt(g_so_warm_key, gcm, gcm_len, plain.data(), plain.size())) {
+        PLOGW("business so: so_warm auth fail %s — drop blob", name.c_str());
+        unlink(blob.c_str());
+        return false;
+    }
+    mkdir(plain_dir.c_str(), 0700);
+    std::string dst = plain_dir + "/" + name;
+    if (!write_all_file_atomic(dst, plain.data(), plain.size())) {
+        memset(plain.data(), 0, plain.size());
+        return false;
+    }
+    chmod(dst.c_str(), 0700);
+    memset(plain.data(), 0, plain.size());
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        SoKey* key = find_key_unlocked(name);
+        if (key != nullptr) {
+            key->decrypted = true;
+            key->in_flight = false;
+        }
+    }
+    g_cv.notify_all();
+    return true;
+}
+
+/** True when every keyed SO present on this ABI has a valid warm hydrate. */
+static bool try_hydrate_all_from_warm(const std::string& cache_root,
+                                      const std::string& nld,
+                                      const std::vector<std::string>& names) {
+    if (!so_warm_key_ok() || cache_root.empty()) return false;
+    std::string warm = so_warm_dir(cache_root);
+    std::string ready = warm + "/" + kSoWarmReady;
+    if (!file_exists_path(ready)) return false;
+    std::string plain = cache_root + "/so_plain";
+    mkdir(plain.c_str(), 0700);
+    int need = 0;
+    int ok = 0;
+    for (const auto& name : names) {
+        if (name.empty() || is_system_soname(name)) continue;
+        std::string src = keyed_packaged_src(name, nld);
+        if (!file_exists_path(src)) continue;
+        off_t ss = file_size_path(src);
+        // Oversized blobs are never cached; leave for RC4 / on-demand.
+        if (ss <= 0 || ss > kWarmMaxPlainBytes) continue;
+        need++;
+        std::string blob = so_warm_blob_path(warm, name);
+        if (!file_exists_path(blob)) return false;
+        if (!try_hydrate_one_from_warm(name, warm, plain, nld)) return false;
+        // After hydrate, decrypted flag set only on success path that wrote file.
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            SoKey* key = find_key_unlocked(name);
+            if (key != nullptr && key->decrypted) ok++;
+        }
+    }
+    if (need == 0 || ok != need) return false;
+    PLOGI("business so: so_warm hydrate ok count=%d", ok);
+    return true;
+}
+
+static bool persist_one_to_warm(const std::string& name,
+                                const std::string& warm_dir,
+                                const std::string& plain_path,
+                                off_t expect_size) {
+    if (!so_warm_key_ok() || name.empty() || is_system_soname(name)) return false;
+    if (expect_size <= 0 || expect_size > kWarmMaxPlainBytes) return false;
+    if (file_size_path(plain_path) != expect_size) return false;
+    std::vector<uint8_t> plain;
+    if (!read_all_file(plain_path, &plain) || static_cast<off_t>(plain.size()) != expect_size) {
+        return false;
+    }
+    uint8_t nonce[12];
+    if (!random_nonce12(nonce)) {
+        memset(plain.data(), 0, plain.size());
+        return false;
+    }
+    size_t gcm_cap = crypto::GCM_NONCE_LEN + plain.size() + crypto::GCM_TAG_LEN;
+    std::vector<uint8_t> gcm(gcm_cap);
+    size_t gcm_len = 0;
+    if (!crypto::aes128_gcm_encrypt(g_so_warm_key, nonce, plain.data(), plain.size(),
+                                    gcm.data(), gcm.size(), &gcm_len)) {
+        memset(plain.data(), 0, plain.size());
+        return false;
+    }
+    memset(plain.data(), 0, plain.size());
+    std::vector<uint8_t> pkg(8 + gcm_len);
+    memcpy(pkg.data(), kPsw1Magic, 4);
+    uint32_t ps = static_cast<uint32_t>(expect_size);
+    pkg[4] = static_cast<uint8_t>(ps);
+    pkg[5] = static_cast<uint8_t>(ps >> 8);
+    pkg[6] = static_cast<uint8_t>(ps >> 16);
+    pkg[7] = static_cast<uint8_t>(ps >> 24);
+    memcpy(pkg.data() + 8, gcm.data(), gcm_len);
+    mkdir(warm_dir.c_str(), 0700);
+    std::string blob = so_warm_blob_path(warm_dir, name);
+    bool ok = write_all_file_atomic(blob, pkg.data(), pkg.size());
+    memset(pkg.data(), 0, pkg.size());
+    memset(gcm.data(), 0, gcm.size());
+    return ok;
+}
+
+static void persist_all_to_warm(const std::string& cache_root,
+                                const std::string& nld,
+                                const std::vector<std::string>& names) {
+    if (!so_warm_key_ok() || cache_root.empty()) return;
+    std::string warm = so_warm_dir(cache_root);
+    std::string plain = cache_root + "/so_plain";
+    mkdir(warm.c_str(), 0700);
+    int wrote = 0;
+    int skip = 0;
+    for (const auto& name : names) {
+        if (name.empty() || is_system_soname(name)) continue;
+        std::string src = keyed_packaged_src(name, nld);
+        if (!file_exists_path(src)) continue;
+        off_t ss = file_size_path(src);
+        std::string dst = plain + "/" + name;
+        bool dec = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            SoKey* key = find_key_unlocked(name);
+            dec = key != nullptr && key->decrypted;
+        }
+        if (!dec || ss <= 0 || ss > kWarmMaxPlainBytes) {
+            skip++;
+            continue;
+        }
+        if (persist_one_to_warm(name, warm, dst, ss)) wrote++;
+        else skip++;
+    }
+    // Ready mark only when every on-ABI keyed SO has a blob.
+    bool complete = true;
+    for (const auto& name : names) {
+        if (name.empty() || is_system_soname(name)) continue;
+        if (!file_exists_path(keyed_packaged_src(name, nld))) continue;
+        off_t ss = file_size_path(keyed_packaged_src(name, nld));
+        if (ss <= 0 || ss > kWarmMaxPlainBytes) continue; // optional skip not required
+        if (!file_exists_path(so_warm_blob_path(warm, name))) {
+            complete = false;
+            break;
+        }
+    }
+    if (complete && wrote > 0) {
+        char body[32];
+        int n = snprintf(body, sizeof(body), "%d\n", wrote);
+        if (n > 0) {
+            write_all_file_atomic(warm + "/" + kSoWarmReady,
+                                  reinterpret_cast<const uint8_t*>(body),
+                                  static_cast<size_t>(n));
+        }
+        PLOGI("business so: so_warm persist wrote=%d skip=%d ready=1", wrote, skip);
+    } else {
+        unlink((warm + "/" + kSoWarmReady).c_str());
+        PLOGI("business so: so_warm persist wrote=%d skip=%d ready=0", wrote, skip);
+    }
 }
 
 /** Stream-copy src→dst via temp+rename. When force=false, skip if sizes already match. */
@@ -850,6 +1335,10 @@ static bool copy_file_bytes(const std::string& src, const std::string& dst, bool
     }
     return file_size_path(dst) == ss;
 }
+
+static bool materialize_one_keyed(const std::string& name,
+                                  const std::string& out_dir,
+                                  const std::string& nld);
 
 /**
  * Copy+RC4 one keyed basename into so_plain if needed.
@@ -918,7 +1407,7 @@ static bool materialize_one_keyed(const std::string& name,
         const off_t ss = file_size_path(src);
         const off_t ds = file_size_path(dst);
         // Only rewrite when missing or size mismatch — never force-clobber a
-        // same-sized file that may already be mmap'd as plaintext.
+        // same-sized file that may already be mmap'd as plaintext (warm reuse).
         const bool need_copy = ds <= 0 || ss <= 0 || ds != ss;
         if (need_copy) {
             if (!copy_file_bytes(src, dst, /*force=*/true)) {
@@ -927,8 +1416,13 @@ static bool materialize_one_keyed(const std::string& name,
                 commit_key(name, false);
                 return false;
             }
+            return rc4_text_on_disk_claimed(dst, name, key_bytes);
         }
-        return rc4_text_on_disk_claimed(dst, name, key_bytes);
+        // Same-sized leftover from a prior launch — treat as plaintext warm.
+        memset(key_bytes, 0, sizeof(key_bytes));
+        commit_key(name, true);
+        strip_verneed_if_old_android(dst);
+        return true;
     }
     PLOGW("business so: materialize_one give up %s", name.c_str());
     return false;
@@ -1191,6 +1685,7 @@ static void materialize_all_keyed_sos() {
     mkdir(out_dir.c_str(), 0700);
     scrub_forbidden_from_so_plain(out_dir);
 
+    // Warm reuse: prior launch left decrypted mirrors + ready mark.
     if (so_plain_ready_ok(out_dir, nld, names)) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
@@ -1240,38 +1735,35 @@ static void materialize_all_keyed_sos() {
                 ok.fetch_add(1);
                 continue;
             }
-            // Never force-clobber a same-sized plaintext mirror: force-copy +
-            // decrypt AlreadyDone would leave packaged ciphertext on disk
-            // (lazy fallback called materialize twice → libd3 SIGSEGV).
+            // Skip when this process already decrypted and mirror size matches.
+            // Cross-launch warm hits so_plain_ready_ok before the worker pool.
+            // Cold start without ready: always recopy from packaged ciphertext
+            // so leftover plaintext is never RC4'd a second time.
             const off_t ss = file_size_path(src);
-            const off_t ds = file_size_path(dst);
             bool already = false;
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 SoKey* key = find_key_unlocked(name);
                 already = key != nullptr && key->decrypted;
             }
-            if (already && ss > 0 && ds == ss) {
+            if (already && ss > 0 && file_size_path(dst) == ss) {
                 ok.fetch_add(1);
                 continue;
             }
-            const bool need_copy = ds <= 0 || ss <= 0 || ds != ss;
-            if (need_copy) {
-                if (!copy_file_bytes(src, dst, /*force=*/true)) {
-                    fail.fetch_add(1);
-                    PLOGW("business so: materialize copy failed %s", name.c_str());
-                    continue;
-                }
-                {
-                    std::lock_guard<std::mutex> lock(g_mu);
-                    SoKey* key = find_key_unlocked(name);
-                    if (key != nullptr) {
-                        key->decrypted = false;
-                        key->in_flight = false;
-                    }
-                }
-                g_cv.notify_all();
+            if (!copy_file_bytes(src, dst, /*force=*/true)) {
+                fail.fetch_add(1);
+                PLOGW("business so: materialize copy failed %s", name.c_str());
+                continue;
             }
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                SoKey* key = find_key_unlocked(name);
+                if (key != nullptr) {
+                    key->decrypted = false;
+                    key->in_flight = false;
+                }
+            }
+            g_cv.notify_all();
             if (decrypt_text_on_disk(dst, name)) {
                 ok.fetch_add(1);
             } else {
@@ -1312,13 +1804,9 @@ static void materialize_all_keyed_sos() {
             }
             continue;
         }
-        const off_t ss = file_size_path(src);
-        const off_t ds = file_size_path(dst);
-        if (ds <= 0 || ss <= 0 || ds != ss) {
-            if (!copy_file_bytes(src, dst, /*force=*/true)) {
-                PLOGE("business so: materialize retry copy failed %s", name.c_str());
-                continue;
-            }
+        if (!copy_file_bytes(src, dst, /*force=*/true)) {
+            PLOGE("business so: materialize retry copy failed %s", name.c_str());
+            continue;
         }
         {
             std::lock_guard<std::mutex> lock(g_mu);
@@ -1351,7 +1839,7 @@ static void materialize_all_keyed_sos() {
             g_full_materialize_done.store(true, std::memory_order_release);
         }
     } else {
-        unlink((out_dir + "/" + kSoPlainReady).c_str());
+        drop_so_plain_ready(out_dir);
         if (fail_n > 0) {
             PLOGE("business so: materialize incomplete ok=%d fail=%d (no warm reuse)",
                   ok_n, fail_n);
@@ -1413,7 +1901,7 @@ void materialize_decrypted_sos() {
     // If dlopen hooks failed (see install_business_so_hooks / preload), we force
     // materialize_all_keyed_sos() as a fallback so ClassLoader never maps ciphertext.
     if (lazy) {
-        unlink((out_dir + "/" + kSoPlainReady).c_str());
+        drop_so_plain_ready(out_dir);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
@@ -1697,7 +2185,7 @@ static void fill_so_plain_async() {
                 PLOGI("business so: background fill ready ok=%d", ok_n);
             }
         } else {
-            unlink((out_dir + "/" + kSoPlainReady).c_str());
+            drop_so_plain_ready(out_dir);
             PLOGW("business so: background fill incomplete ok=%d fail=%d (no ready)",
                   ok_n, fail_n);
         }
@@ -1755,8 +2243,8 @@ void preload_so_plain() {
         // Dep symlinks / GLES scrub before any pin.
         copy_plain_deps(plain_dir, nld);
         // Phase 2: do not force-dlopen every keyed SO. Only pin mirrors already
-        // in so_plain (warm reuse / prior on-demand). Missing libs decrypt on
-        // first hooked dlopen via keyed DT_NEEDED closure (Phase 1).
+        // materialized this process (on-demand). Missing libs decrypt on first
+        // hooked dlopen via keyed DT_NEEDED closure.
         for (const auto& name : keyed) {
             if (!file_exists_path(plain_dir + "/" + name)) {
                 skipped_missing++;
@@ -1771,7 +2259,7 @@ void preload_so_plain() {
               "skipped_missing=%d keyed=%zu cost_ms=%lld",
               ok, fail, ok + fail, skipped_missing, keyed.size(),
               static_cast<long long>(ms));
-        // Phase 3: finish remaining keyed SOs off the critical path for warm reuse.
+        // Phase 3: finish remaining keyed SOs off the critical path this process.
         fill_so_plain_async();
         return;
     }
@@ -2007,16 +2495,17 @@ static void* fake_android_dlopen_ext(const char* filename, int flags, const void
 }
 
 /**
- * L2b: ANDROID_DLEXT_USE_LIBRARY_FD still maps so_plain inode; rewrite dli_fname
- * to the extract path recorded at L2 open so OSG/path-sensitive code matches.
+ * L2b: LIBRARY_FD may map so_plain or memfd; rewrite dli_fname to the extract
+ * path recorded at L2 open so OSG/path-sensitive code matches.
  */
 static int fake_dladdr(const void* addr, Dl_info* info) {
     BYTEHOOK_STACK_SCOPE();
     int r = BYTEHOOK_CALL_PREV(fake_dladdr, addr, info);
     if (r == 0 || info == nullptr || info->dli_fname == nullptr) return r;
     const char* fname = info->dli_fname;
-    if (strstr(fname, "/so_plain/") == nullptr) return r;
-    std::string base = basename_of(fname);
+    const bool memfd_name = strstr(fname, "/memfd:") != nullptr;
+    if (strstr(fname, "/so_plain/") == nullptr && !memfd_name) return r;
+    std::string base = keyed_soname_from_fname(fname);
     if (base.empty() || !is_keyed_basename(base)) return r;
 
     std::string extract;

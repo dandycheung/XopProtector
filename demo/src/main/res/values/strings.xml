@@ -5,4 +5,7 @@
     <string name="status_fail">FAIL</string>
     <string name="status_unpacked">UNPACKED</string>
     <string name="status_error">ERROR: %1$s</string>
+    <string name="lifecycle_pass">lifecycle=PASS</string>
+    <string name="lifecycle_partial">lifecycle=PARTIAL (ProcessLifecycleOwner broken)</string>
+    <string name="lifecycle_fail">lifecycle=FAIL</string>
 </resources>

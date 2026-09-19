@@ -232,6 +232,57 @@ bool aes128_gcm_decrypt(const uint8_t key[16],
     return true;
 }
 
+bool aes128_gcm_encrypt(const uint8_t key[16],
+                        const uint8_t nonce[12],
+                        const uint8_t* plain, size_t plain_len,
+                        uint8_t* out, size_t out_cap, size_t* out_len) {
+    if (key == nullptr || nonce == nullptr || plain == nullptr || out == nullptr
+            || out_len == nullptr) {
+        return false;
+    }
+    size_t need = GCM_NONCE_LEN + plain_len + GCM_TAG_LEN;
+    if (out_cap < need) return false;
+
+    uint8_t H[16];
+    uint8_t zero[16] = {0};
+    aes128_encrypt_block(key, zero, H);
+
+    uint8_t J0[16] = {0};
+    memcpy(J0, nonce, GCM_NONCE_LEN);
+    J0[15] = 1;
+
+    memcpy(out, nonce, GCM_NONCE_LEN);
+    uint8_t* ct = out + GCM_NONCE_LEN;
+
+    uint8_t counter[16];
+    memcpy(counter, J0, 16);
+    gcm_ctr32_inc(counter);
+
+    size_t offset = 0;
+    while (offset < plain_len) {
+        uint8_t ks[16];
+        aes128_encrypt_block(key, counter, ks);
+        size_t n = plain_len - offset;
+        if (n > 16) n = 16;
+        for (size_t i = 0; i < n; i++) {
+            ct[offset + i] = plain[offset + i] ^ ks[i];
+        }
+        offset += n;
+        gcm_ctr32_inc(counter);
+    }
+
+    uint8_t S[16];
+    ghash(H, nullptr, 0, ct, plain_len, S);
+
+    uint8_t E0[16];
+    aes128_encrypt_block(key, J0, E0);
+    uint8_t* tag = out + GCM_NONCE_LEN + plain_len;
+    for (int i = 0; i < 16; i++) tag[i] = S[i] ^ E0[i];
+
+    *out_len = need;
+    return true;
+}
+
 // ── Self-test vs Java javax.crypto reference vectors (CryptoUtils) ──
 // Keep AES self-test vectors out of .bitcode (packer encrypts that whole section).
 #define PROT_RODATA __attribute__((section(".rodata.prot"), used))
@@ -261,6 +312,18 @@ bool aes_self_test() {
     uint8_t gcm_plain[32];
     if (!aes128_gcm_decrypt(key, kGcmPkg, sizeof(kGcmPkg), gcm_plain, 32)) return false;
     if (memcmp(gcm_plain, plain, 32) != 0) return false;
+
+    // Encrypt round-trip with the same nonce as the Java vector.
+    uint8_t nonce[12];
+    memcpy(nonce, kGcmPkg, 12);
+    uint8_t enc_pkg[12 + 32 + 16];
+    size_t enc_len = 0;
+    if (!aes128_gcm_encrypt(key, nonce, plain, 32, enc_pkg, sizeof(enc_pkg), &enc_len)) {
+        return false;
+    }
+    if (enc_len != sizeof(kGcmPkg) || memcmp(enc_pkg, kGcmPkg, sizeof(kGcmPkg)) != 0) {
+        return false;
+    }
 
     // NIST AES-128 ECB block
     static const uint8_t kNistKey[16] PROT_RODATA = {

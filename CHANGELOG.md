@@ -1,12 +1,153 @@
 # Changelog
 
-## 0.6.29
+## 0.6.30
 
-- Desktop / installer / packer jar version **0.6.29**.
+- Desktop / installer / packer jar / native version **0.6.30**.
 
 ## 0.6.28
 
 - Desktop / installer / packer jar version **0.6.28**.
+
+## 0.6.44
+
+- Packer SO protect: basename all-or-none across ABIs — if any ABI is skipped for
+  `path_sensitive` / text-reloc / no `.text`, sibling ABIs are not encrypted
+  (`*_abi`). Fixes arm64 plaintext + v7a cipher for the same soname (e.g.
+  `liblibpag.so`) where sokeys is basename-keyed → RC4 corrupt → SIGILL.
+- SAFE/MAX industry skip: `libpag` / `liblibpag` prefixes (PAG GLES megacore).
+- Desktop / installer / packer jar / native version **0.6.44**.
+
+## 0.6.43
+
+- PVM2 `dispatch_exception` JNI correctness:
+  - `ExceptionClear` before `dup_owned_ref` (NewLocalRef/NewGlobalRef illegal
+    while an exception is pending).
+  - `global_to_local` deletes the Global only after a successful `NewLocalRef`;
+    on OOM, rethrow via Global so the throwable is not dropped.
+- Desktop / installer / packer jar / native version **0.6.43**.
+
+## 0.6.42
+
+- PVM2 nested-frame JNI Local scrub + exception OEM safety (Honor/Huawei Alipay
+  nested `PayTask.payV2` → `Call*` → inner VMP):
+  - `scrub_ref_aliases` walks the full `InterpFrame` prev chain so inner
+    `DeleteLocalRef` cannot leave outer regs holding a freed cookie.
+  - `clear_regs` scrub before delete covers outer frames; stash teardown uses
+    `release_stash`.
+  - `dispatch_exception`: `dup_owned_ref` / transfer ownership into stash (no
+    `NewLocalRef`+`DeleteLocalRef` alias); Throw path uses `release_ref`.
+- Desktop / installer / packer jar / native version **0.6.42**.
+
+## 0.6.41
+
+- PVM2 JNI Local alias hardening (Honor/Huawei `attempt to remove stale Local` on
+  Alipay `PayTask.payV2` / `m.p.e.a` after 0.6.40):
+  - Frame-scoped scrub: every owned `DeleteLocalRef`/`DeleteGlobalRef` clears the
+    same jobject cookie from all regs / pending / stash first.
+  - `dup_owned_ref`: when OEM `NewLocalRef` returns the same cookie, fall back to
+    `NewGlobalRef` for move-object / args / const-class copies.
+  - `return-object` promotes via GlobalRef across `clear_regs`; move-exception
+    transfers stash ownership (no NewLocalRef+Delete alias).
+- Desktop / installer / packer jar / native version **0.6.41**.
+
+## 0.6.40
+
+- PVM2 JNI Local ownership: `iget`/`sget`/`aget` KIND_L use `reg_take_o`
+  (skip `DeleteLocalRef` when `old == got`); `clear_regs` dedupes aliased
+  jobject cookies before delete. Fixes ART abort
+  `attempt to remove stale Local` on Alipay `PayTask.payV2` / `m.p.e.a`
+  under full payment True-VMP (Honor/Huawei). Keep Alipay VMP open.
+- Desktop / installer / packer jar / native version **0.6.40**.
+
+## 0.6.39
+
+- Payment Auto True-VMP: clear Alipay pay hot-path denylist — reopen
+  `Lcom/alipay/android/app/` (`IAlixPay$Stub` / Binder surface). Full Alipay +
+  `/wxapi/` coverage under payment auto-VMP.
+- Desktop / installer / packer jar version **0.6.39**.
+
+## 0.6.38
+
+- Payment Auto True-VMP: reopen Alipay `sdk/app` (incl. `PayTask`). Hot-path
+  denylist now only `Lcom/alipay/android/app/` (Binder `IAlixPay$Stub`).
+
+## 0.6.37
+
+- PVM2 `iget` / `instance-of`: same register-alias fix as `aget` — do not
+  `reg_as_i/j(dst)` before `Get*Field` / `IsInstanceOf`. `iget v0, v0, Field`
+  deleted the object local then `GetIntField` SIGSEGV (fault `0xb1`) on Alipay
+  `m.u.n.f`.
+
+## 0.6.36
+
+- PVM2 `aget`: do not `reg_as_i/j(dst)` before reading the array — when `dst`
+  aliases the array register (`aget v0, v0, v1`), early drop deletes the live
+  array local and `IsInstanceOf` SIGSEGV (fault `0x31`) on Alipay `m.u.j`→`m.n.a`.
+  Read array first, then overwrite `dst`. Type-check before `Get*ArrayRegion`
+  for Z/B/S/C remains. `sdk/m/u` stays True-VMP'd.
+
+## 0.6.35
+
+- PVM2 semantics: register kind tag (`RK_I`/`RK_J`/`RK_L`) so `if-eqz`/`if-nez`/
+  `if-eq`/`if-ne` on objects use nullness / `IsSameObject` instead of leftover
+  `.i`. `invoke-direct` uses `CallNonvirtual*`. `sdk/m/u` still crashes
+  (`SIGSEGV` in `GetCharArrayRegion` / aget via `m.u.j`→`m.n.*`); keep denylisted.
+
+## 0.6.34
+
+- PVM2: fix `DeleteLocalRef` across `PushLocalFrame` in `invoke_method` (ART
+  "index outside index area" when clearing outer `pending` / throwing NPE inside
+  the frame). Clear pending + null-receiver checks happen before Push; frame only
+  wraps `Call*`. `sdk/m/u` True-VMP still returns Alipay `4000` (no JNI warn);
+  keep `m/u` on denylist until interpret semantics fixed.
+
+## 0.6.33
+
+- PVM2 interpreter JNI Local hardening (fixes Alipay `PayTask.payV2` stale Local /
+  `GetObjectField` abort under payment Auto True-VMP):
+  - L1: take ownership of `Call*Object` / `Get*ObjectField` / `aget` returns (no
+    double `NewLocalRef` leak).
+  - L2: `PushLocalFrame` RAII around `invoke_method`; object results promoted via
+    `PopLocalFrame`.
+  - L3: `EnsureLocalCapacity(regs+256)`; GlobalRef cache for classes / exceptions /
+    box types; no `FindClass` leak on hot paths.
+  - Fix register-alias stale Local: `iget`/`sget`/`aget` object must Get-then-Delete
+    (supports `iget-object vX, vX, field`); `move-object vX, vX` is a no-op.
+  - Null receiver/object: throw NPE before `Call*MethodA` / `iget`/`iput`/`aget`/`aput`/
+    `array-length` (CheckJNI aborts on null `obj` otherwise).
+- **Payment Auto True-VMP + Alipay (phased):** denylist `sdk/app`, `android/app`
+  (AIDL). Full `sdk/m/*` + `android/phone` + `apmobilesecuritysdk` + `/wxapi/`.
+
+## 0.6.32
+
+- Desktop / installer / packer jar / native version string **0.6.32**.
+- After Proxy→real Application reattach, transfer `ActivityLifecycleCallbacks`
+  (fixes `ProcessLifecycleOwner` stuck after `androidx.startup` init on Proxy).
+- Also transfer `ComponentCallbacks` / Assist via public APIs on
+  `ProxyApplication` (API 34+ blocks reflecting `mCallbacksController`).
+- Reflection migrate kept as fallback; best-effort `HiddenApiBypass` for older paths.
+- Extra protect (assets / res-protect / NetGuard / pin-certs) stays **off** in
+  Desktop + `protectDemo` (ExtraProtectPanel collapsed; CLI-only). `--encrypt-assets`
+  requires the app to use `ProtectorAssets` — no transparent `AssetManager` hook.
+
+## 0.6.31
+
+- Fix Android 16 / 卓易通 SIGSEGV: ART `DefineClass` gained `descriptor_length`
+  before `hash`; Dobby now uses V36 ABI + mangling (`EPKcmm` / `EPKcjj`) so
+  `DexFile`/`ClassDef` args are not shifted into poison pointers.
+- DefineClass ABI selection is mangling-first: `EPKcmm`/`EPKcjj` → V36;
+  clear `EPKcm`/`EPKcj` → V22; do not force V36 solely because `sdk>=36`.
+
+## 0.6.30
+
+- Desktop / installer / packer jar / native version string **0.6.30**
+  (current shipping line; versions unified).
+- API 36 / OEM ART: safe `DexFile` probe (`process_vm_readv` + memcpy fallback),
+  system-class DefineClass bypass, exact mangling + RX check; junk verify off ART callback.
+- No separate `V36::DexFile` (sdk≥35 keeps V35 layout).
+- Extra protect (assets / res-protect / NetGuard / pin-certs) stays **off** in
+  Desktop + `protectDemo` (ExtraProtectPanel collapsed; CLI-only). `--encrypt-assets`
+  requires the app to use `ProtectorAssets` — no transparent `AssetManager` hook.
 
 ## 0.6.27
 
@@ -29,6 +170,64 @@
   `.text` under execute-only memory (SEGV_ACCERR); use `process_vm_readv` instead.
 
 ## Unreleased
+
+### Runtime — restore plaintext warm reuse (startup)
+- Cross-launch reuse of **`so_plain/` + `so_plain_ready`** and DEX **`.prepatched`**
+  (product chose speed over encrypted `so_warm` / in-process unlink).
+- Do not drop keyed mirrors or ready marks each launch; APK stamp still
+  invalidates the whole protector cache on update.
+- `maybe_drop_so_plain_mirror` is a no-op so L2/memfd loads keep disk mirrors
+  for the next process. Encrypted PSW1 hydrate/persist is unused on this path.
+
+### Runtime — shorten in-process SO plaintext (PR12)
+- L2 prefers an optional **memfd** (`memfd_create`, SOs ≤ 16 MiB) as
+  `ANDROID_DLEXT_USE_LIBRARY_FD` content; falls back to the `so_plain` fd, then L3
+  `dlopen(so_plain/...)`.
+- L2b `dladdr` also rewrites `/memfd:` names; in-memory RC4 is skipped for SOs
+  already mapped from plaintext.
+- *(Superseded for cross-launch disk policy by plaintext warm above.)*
+
+### Packer / Runtime — Integrity v2 (PR13)
+- Config HMAC now also covers `code_methods_hmac`: HMAC-SHA256 of the canonical
+  hollow/VMP method set (LE count + sorted `dex, method_idx, flags`), matching
+  parsed `code.bin`.
+- After extract, every `code.bin` method must exist as a concrete (`code_off != 0`)
+  method in the matching `classes*.dex`. Fail closed. Not a Java↔Native↔VM mesh.
+
+### Runtime — syscall read of protector assets (PR14)
+- `config.json`, `code.bin`, `dexes.zip`, and the APK signing block are read via
+  `openat`/`read`/`lseek`/`fstat`/`close` syscalls, not libc `fopen`/`ifstream`/`pread`.
+- Does **not** convert process-wide I/O (`/proc/maps`, SO materialize, DEX write).
+
+### Runtime — small shell self-protect (PR15)
+- `JNI_OnLoad` pins `JniBridge` and `ProxyApplication` class global refs.
+- Heartbeat is `heartbeat(Application shell)`: native records a ping only when
+  the caller class is the pinned `JniBridge` and `shell` is a `ProxyApplication`.
+  Forged pings abort (`java_shell`).
+- Ping immediately, then every 5 s. Capture `this` from `attachBaseContext`
+  (still `ProxyApplication` after replace). Do **not** check
+  `ActivityThread.currentApplication()`.
+- `init_app` arms the window. First legal ping must arrive within **90 s**
+  (covers DexMerger / SO decrypt after arm, especially ACF `FileBootstrap`).
+  After that, a gap &gt; **15 s** aborts. Never pinging after init is a timeout,
+  not a skip. Does **not** randomize shell package names or specialize
+  `RegisterNatives`.
+- Heartbeat thread starts immediately after `init_app` (Application path) or
+  when ACF instantiates `ProxyApplication`, then pings every 5 s.
+
+### Runtime — PR12–PR15 review fixes
+- L1/L2 mark keyed SO as already-plain **before** `dlopen` / `android_dlopen_ext`
+  so `.init_array` cannot RC4 a plaintext memfd/extract mapping.
+- PVM2 `fill-array-data` scratch scan walks real Dalvik insns (a `const/16 0x26`
+  no longer inflates scratch and rejects 30–31-reg methods).
+- Protector asset `read`/`openat` retry `EINTR`.
+- `libprotector.so` `.bitcode` is RX at load (K_master slot is `const`). A
+  writable object in that section made LLD emit a WX `PT_LOAD`; Android 10+
+  then refused `dlopen` (`W+E load segments are not allowed`).
+- Bitcode HMAC bind: wipe the `const` K_master slot with volatile stores
+  (Release `memset` through `const_cast` was UB and could be deleted). HMAC
+  itself matches packer `hmacBitcodePostWipe` (slot treated as zeros) so a
+  failed in-place wipe is not a false integrity fail.
 
 - Temporarily disable assets encrypt / res-protect / NetGuard in desktop + `protectDemo`
   (code kept; ExtraProtectPanel stays collapsed). Demo smoke no longer requires them.

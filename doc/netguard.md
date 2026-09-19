@@ -18,10 +18,10 @@ Also sets `config.json` fields `detect_proxy` / `net_guard` (HMAC-covered).
 - Pinning: `NetGuard.wrappingTrustManager(base)` for app HTTPS stacks
 - **Not** the same as `verifySignature` (APK signing cert)
 
-## Demo
+## Availability
 
-`protectDemo` enables `--detect-proxy` + `--pin-certs demo/pins-demo.txt`.
-Expect logcat `net=installed/1/proxy=false` and `status=PASS` (VPN on device may set proxy=true and fail the check).
+Default **OFF**. `protectDemo` and Desktop ExtraProtect UI do **not** enable NetGuard;
+use packer CLI when needed (`--detect-proxy`, `--pin-certs <file>`).
 
 ## Usage (app)
 

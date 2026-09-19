@@ -17,5 +17,9 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <provider
+            android:name=".ComponentCallbackProbeProvider"
+            android:authorities="${applicationId}.compcb-probe"
+            android:exported="false" />
     </application>
 </manifest>

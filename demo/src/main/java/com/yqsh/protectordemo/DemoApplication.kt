@@ -9,7 +9,12 @@ import android.util.Log
 class DemoApplication : Application() {
     override fun onCreate() {
         super.onCreate()
-        Log.i(TAG, "DemoApplication.onCreate native=" + safeNativeVersion())
+        Log.i(TAG, "DemoApplication.onCreate native=" + safeNativeVersion()
+                + " this=" + javaClass.name)
+        // Register on the real Application after shell replace — mirrors customer
+        // ProcessLifecycleOwner / ActivityLifecycleCallbacks usage.
+        LifecycleProbe.installAppActivityCallbacks(this)
+        LifecycleProbe.installProcess(this)
     }
 
     private fun safeNativeVersion(): String {

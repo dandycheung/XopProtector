@@ -141,6 +141,10 @@ public final class BusinessSoProtector {
             "libsqlcipher",
             "librive",
             "libskia",
+            // PAG (libpag / liblibpag) — GLES megacore; ABI-asymmetric path_sensitive
+            // previously encrypted only v7a while arm64 stayed plaintext → RC4 corrupt.
+            "libpag",
+            "liblibpag",
             "libicu",
             "libharfbuzz",
             "libfreetype",
@@ -513,6 +517,9 @@ public final class BusinessSoProtector {
         // Phase 1: collect candidates (and all-ABI siblings for selected basenames later).
         Map<String, List<Candidate>> allByBasename = new LinkedHashMap<>();
         List<Candidate> primaryCandidates = new ArrayList<>();
+        // Per-file skips that must block the whole basename: sokeys is basename-keyed;
+        // encrypting only some ABIs RC4-corrupts plaintext siblings (SIGILL on load).
+        Map<String, String> basenameAbiBlock = new LinkedHashMap<>();
 
         for (File abi : abis) {
             String abiName = abi.getName();
@@ -537,6 +544,7 @@ public final class BusinessSoProtector {
                 // SAFE/MAX: skip path-sensitive megacores (runtime L1/L2 may still
                 // encrypt them under AGGRESSIVE). See docs/so-load-contract.md.
                 if (m != Mode.AGGRESSIVE && isPathSensitive(so)) {
+                    basenameAbiBlock.putIfAbsent(name, "path_sensitive");
                     result.skippedPolicy.add(new SoDecision(
                             abiName, name, so.length(), 0, 0, "path_sensitive"));
                     System.out.println("SKIP business SO (path_sensitive): "
@@ -544,6 +552,7 @@ public final class BusinessSoProtector {
                     continue;
                 }
                 if (hasUnsafeTextRelocs(so)) {
+                    basenameAbiBlock.putIfAbsent(name, "relocs patch .text");
                     result.skippedReloc.add(new SoDecision(
                             abiName, name, so.length(), 0, 0, "relocs patch .text"));
                     System.out.println("SKIP business SO (relocs patch .text): "
@@ -552,6 +561,7 @@ public final class BusinessSoProtector {
                 }
                 long textSize = readTextSize(so);
                 if (textSize <= 0) {
+                    basenameAbiBlock.putIfAbsent(name, "no .text");
                     result.skippedPolicy.add(new SoDecision(
                             abiName, name, so.length(), 0, 0, "no .text"));
                     System.out.println("SKIP business SO (no .text): "
@@ -570,6 +580,29 @@ public final class BusinessSoProtector {
                     continue;
                 }
                 primaryCandidates.add(c);
+            }
+        }
+
+        // Drop candidates whose basename was blocked on any ABI (keep encrypt all-or-none).
+        if (!basenameAbiBlock.isEmpty()) {
+            for (Map.Entry<String, String> e : basenameAbiBlock.entrySet()) {
+                String name = e.getKey();
+                String blockReason = e.getValue();
+                List<Candidate> siblings = allByBasename.remove(name);
+                primaryCandidates.removeIf(c -> c.name.equals(name));
+                if (siblings == null || siblings.isEmpty()) continue;
+                String siblingReason = blockReason + "_abi";
+                for (Candidate c : siblings) {
+                    if ("relocs patch .text".equals(blockReason)) {
+                        result.skippedReloc.add(new SoDecision(
+                                c.abi, c.name, c.fileBytes, c.textBytes, 0, siblingReason));
+                    } else {
+                        result.skippedPolicy.add(new SoDecision(
+                                c.abi, c.name, c.fileBytes, c.textBytes, 0, siblingReason));
+                    }
+                    System.out.println("SKIP business SO (" + siblingReason + "): "
+                            + c.path() + " (basename blocked on another ABI)");
+                }
             }
         }
 
@@ -898,8 +931,8 @@ public final class BusinessSoProtector {
         return new String(tab, off, end - off, StandardCharsets.US_ASCII);
     }
 
-    /** Build plaintext key table then AES-GCM wrap with dexAesKey → PSOK file bytes. */
-    public static byte[] buildSokeysBlob(List<Entry> entries, byte[] dexAesKey) throws Exception {
+    /** Build plaintext key table then AES-GCM wrap with {@code K_so} → PSOK file bytes. */
+    public static byte[] buildSokeysBlob(List<Entry> entries, byte[] soWrapKey) throws Exception {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         writeU32(bos, entries.size());
         for (Entry e : entries) {
@@ -909,7 +942,7 @@ public final class BusinessSoProtector {
             bos.write(e.key);
         }
         byte[] plain = bos.toByteArray();
-        byte[] enc = CryptoUtils.aesGcmEncrypt(dexAesKey, plain);
+        byte[] enc = CryptoUtils.aesGcmEncrypt(soWrapKey, plain);
         byte[] out = new byte[4 + enc.length];
         out[0] = 'P';
         out[1] = 'S';

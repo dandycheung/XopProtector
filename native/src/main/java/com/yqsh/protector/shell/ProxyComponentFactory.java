@@ -48,6 +48,8 @@ public class ProxyComponentFactory extends AppComponentFactory {
             throws InstantiationException, IllegalAccessException, ClassNotFoundException {
         Log.d(TAG, "instantiateApplication " + className);
         Application app = super.instantiateApplication(cl, className);
+        // Heartbeat JNI only needs the Application instance, not a base Context.
+        ProxyApplication.onShellInstantiated(app);
         // Prefer verifying here once a Context exists (ACF early path may lack one).
         tryVerifySignature(app);
         return app;
@@ -83,13 +85,13 @@ public class ProxyComponentFactory extends AppComponentFactory {
             File apk = new File(aInfo.sourceDir);
             ProxyApplication.invalidateIfApkChanged(codeCache, apk);
 
-            // Warm: classes*.dex already prepatched — skip re-copying/decrypting ~MB dexes.zip.
+            // Warm: classes*.dex already prepatched — skip re-copying/decrypting dexes.zip.
             boolean warm = DexMerger.hasWarmCache(codeCache);
             if (!warm) {
                 extractFromApk(apk, "assets/protector/dexes.zip", new File(codeCache,
                         StrEnc.d(new byte[]{
                                 0x3e, 0x24, 0x14, 0x6e, 0x45, (byte)0xf3, (byte)0x82, (byte)0x8e, (byte)0xf2
-                        })));
+                        })), true);
             } else {
                 Log.i(TAG, "warm cache: skip dexes.zip extract");
             }
@@ -134,7 +136,7 @@ public class ProxyComponentFactory extends AppComponentFactory {
             if (aInfo.nativeLibraryDir != null) {
                 JniBridge.setNativeLibraryDir(aInfo.nativeLibraryDir);
             }
-            JniBridge.initApp(codeCache.getAbsolutePath());
+            JniBridge.initApp(codeCache.getAbsolutePath(), aInfo.packageName, aInfo.sourceDir);
             // nativeLibraryDir → so_plain for path-sensitive dladdr; ClassLoader
             // still keeps packaged extract as fallback for excluded/unkeyed SOs.
             String packaged = aInfo.nativeLibraryDir;
@@ -157,7 +159,17 @@ public class ProxyComponentFactory extends AppComponentFactory {
         }
 
         private static void extractFromApk(File apk, String entryName, File out) throws Exception {
-            if (out.exists() && out.length() > 0) return;
+            extractFromApk(apk, entryName, out, false);
+        }
+
+        /**
+         * @param forceOverwrite when true, replace any leftover (needed for
+         *        {@code dexes.zip}: a prior launch may have left plaintext PDX1
+         *        fallback bytes that would fail {@code dex_hmac}).
+         */
+        private static void extractFromApk(File apk, String entryName, File out, boolean forceOverwrite)
+                throws Exception {
+            if (!forceOverwrite && out.exists() && out.length() > 0) return;
             try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(apk)) {
                 java.util.zip.ZipEntry e = zf.getEntry(entryName);
                 if (e == null) {

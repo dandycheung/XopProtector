@@ -39,9 +39,12 @@ add_library(protector SHARED
         common/runtime_state.cpp
         common/crc32.cpp
         common/elf_util.cpp
+        common/sys_io.cpp
         crypto/rc4.c
         crypto/aes.cpp
         crypto/sha256.cpp
+        crypto/apk_sign.cpp
+        crypto/key_ladder.cpp
         crypto/section_decrypt.cpp
         crypto/assets_crypt.cpp
         codeitem/multi_dex_code.cpp

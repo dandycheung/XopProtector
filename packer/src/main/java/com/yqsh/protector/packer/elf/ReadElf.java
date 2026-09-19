@@ -478,4 +478,16 @@ public class ReadElf implements AutoCloseable {
     public List<SectionHeader> getSectionHeaders() {
       return mSectionHeaderList;
     }
+
+    public SectionHeader getSectionHeader(String name) {
+        if (name == null || mSectionHeaderList == null) {
+            return null;
+        }
+        for (SectionHeader sh : mSectionHeaderList) {
+            if (name.equals(sh.getName())) {
+                return sh;
+            }
+        }
+        return null;
+    }
 }

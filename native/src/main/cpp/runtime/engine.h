@@ -5,12 +5,13 @@
 namespace protector::runtime {
 
 void on_load(JavaVM* vm);
-void init_app(JNIEnv* env, jclass clazz, jstring protector_dir);
+void init_app(JNIEnv* env, jclass clazz, jstring protector_dir,
+              jstring package_name, jstring apk_path);
 jstring read_application_name(JNIEnv* env, jclass clazz);
 jstring native_version(JNIEnv* env, jclass clazz);
-/** Verify APK signing cert SHA-256 against config; no-op if unset. */
+/** Native v2/v3 first-signer cert SHA-256 vs config; fail closed if missing. */
 void verify_signature(JNIEnv* env, jclass clazz, jobject context);
-/** Occasional JunkClass presence check (uses stored JavaVM). */
+/** Occasional JunkClass presence check. Must not run from ART DefineClass. */
 void maybe_verify_junk_class();
 /** Allow junk checks after ClassLoader + DexMerger are ready. */
 void enable_junk_verify(JNIEnv* env, jclass clazz);

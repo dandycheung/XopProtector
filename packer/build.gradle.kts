@@ -9,7 +9,7 @@ java {
 
 tasks.jar {
     archiveBaseName.set("protector-packer")
-    archiveVersion.set("0.6.29")
+    archiveVersion.set("0.6.30")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     manifest {
         attributes["Main-Class"] = "com.yqsh.protector.packer.PackerMain"

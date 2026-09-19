@@ -2,6 +2,7 @@
 #include "crypto/aes.h"
 #include "common/log.h"
 #include "common/protector_macro.h"
+#include "common/sys_io.h"
 
 #include <chrono>
 #include <cstdio>
@@ -19,18 +20,7 @@ namespace {
 constexpr size_t kIoBuf = 256 * 1024;
 
 static bool read_all(const std::string& path, std::vector<uint8_t>& out) {
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs) return false;
-    ifs.seekg(0, std::ios::end);
-    auto sz = ifs.tellg();
-    if (sz <= 0) return false;
-    ifs.seekg(0, std::ios::beg);
-    out.resize(static_cast<size_t>(sz));
-    if (!ifs.read(reinterpret_cast<char*>(out.data()), sz)) {
-        out.clear();
-        return false;
-    }
-    return true;
+    return protector::sys_read_file(path.c_str(), out);
 }
 
 static bool write_all(const std::string& path, const uint8_t* data, size_t len) {
@@ -318,12 +308,9 @@ bool decrypt_and_extract_dexes(const std::string& zip_path,
     }
 
     if (!ok) {
-        // Fallback: leave/write plaintext zip for Java DexMerger unzip.
+        // This process only: write plaintext zip so Java DexMerger can unzip.
+        // Next launch force-extracts PDX1 from the APK (must not HMAC this leftover).
         PLOGW("native dex extract failed — falling back to plaintext zip path");
-        if (own_plain) {
-            // plain already wiped — need re-decrypt
-            return decrypt_dexes_zip_file(zip_path, key);
-        }
         return decrypt_dexes_zip_file(zip_path, key);
     }
 

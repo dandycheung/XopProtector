@@ -5,4 +5,7 @@
     <string name="status_fail">失败</string>
     <string name="status_unpacked">未加密</string>
     <string name="status_error">错误：%1$s</string>
+    <string name="lifecycle_pass">lifecycle=通过</string>
+    <string name="lifecycle_partial">lifecycle=部分失败(ProcessLifecycleOwner)</string>
+    <string name="lifecycle_fail">lifecycle=失败</string>
 </resources>

@@ -7,12 +7,15 @@
 #include "risk/risk.h"
 #include "risk/so_guard.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace protector::vm {
@@ -21,6 +24,16 @@ struct Reg {
     int32_t i = 0;
     int64_t j = 0;
     jobject o = nullptr;
+    /** RK_I / RK_J / RK_L — Dalvik if-eqz on objects must use .o, not leftover .i. */
+    uint8_t k = 0;
+    /** When true, o is a GlobalRef (OEM NewLocalRef alias fallback). */
+    bool o_global = false;
+};
+
+enum : uint8_t {
+    RK_I = 0,
+    RK_J = 1,
+    RK_L = 2,
 };
 
 struct PendingResult {
@@ -28,7 +41,127 @@ struct PendingResult {
     int32_t i = 0;
     int64_t j = 0;
     jobject o = nullptr;
+    uint8_t k = RK_I;
+    bool o_global = false;
 };
+
+/** Active interpret frame — used to scrub aliased jobject cookies before Delete*. */
+struct InterpFrame {
+    std::vector<Reg>* regs = nullptr;
+    PendingResult* pending = nullptr;
+    jobject* stashed_exception = nullptr;
+    /** Outer interpret on this thread (nested VMP via Call* → VmBridge). */
+    InterpFrame* prev = nullptr;
+};
+
+static thread_local InterpFrame* g_interp_frame = nullptr;
+
+struct InterpFrameScope {
+    InterpFrame frame;
+    InterpFrameScope(std::vector<Reg>& regs, PendingResult& pending, jobject* stashed) {
+        frame.regs = &regs;
+        frame.pending = &pending;
+        frame.stashed_exception = stashed;
+        frame.prev = g_interp_frame;
+        g_interp_frame = &frame;
+    }
+    ~InterpFrameScope() { g_interp_frame = frame.prev; }
+};
+
+static void scrub_one_frame(InterpFrame* f, jobject o) {
+    if (f == nullptr || o == nullptr) {
+        return;
+    }
+    if (f->regs != nullptr) {
+        for (auto& r : *f->regs) {
+            if (r.o == o) {
+                r.o = nullptr;
+                r.o_global = false;
+            }
+        }
+    }
+    if (f->pending != nullptr && f->pending->o == o) {
+        f->pending->o = nullptr;
+        f->pending->o_global = false;
+    }
+    if (f->stashed_exception != nullptr && *f->stashed_exception == o) {
+        *f->stashed_exception = nullptr;
+    }
+}
+
+/** Null every slot that holds cookie o across this + outer nested interpret frames. */
+static void scrub_ref_aliases(jobject o) {
+    if (o == nullptr) {
+        return;
+    }
+    for (InterpFrame* f = g_interp_frame; f != nullptr; f = f->prev) {
+        scrub_one_frame(f, o);
+    }
+}
+
+static void release_ref(JNIEnv* env, jobject o, bool is_global) {
+    if (o == nullptr) {
+        return;
+    }
+    scrub_ref_aliases(o);
+    if (is_global) {
+        env->DeleteGlobalRef(o);
+    } else {
+        env->DeleteLocalRef(o);
+    }
+}
+
+static void release_stash(JNIEnv* env, jobject* stashed) {
+    if (stashed == nullptr || *stashed == nullptr) {
+        return;
+    }
+    jobject o = *stashed;
+    *stashed = nullptr;
+    release_ref(env, o, false);
+}
+
+/**
+ * Copy a reference into a distinct JNI handle for register ownership.
+ * On OEM ART, NewLocalRef(local) may return the same cookie — fall back to GlobalRef
+ * so move-object / arg copies do not share a deletable Local slot.
+ */
+static jobject dup_owned_ref(JNIEnv* env, jobject src, bool* out_global) {
+    *out_global = false;
+    if (src == nullptr) {
+        return nullptr;
+    }
+    jobject local = env->NewLocalRef(src);
+    if (local != nullptr && local != src) {
+        return local;
+    }
+    jobject global = env->NewGlobalRef(src);
+    if (global != nullptr) {
+        *out_global = true;
+        return global;
+    }
+    // Last resort: keep whatever NewLocalRef gave (may alias src).
+    return local != nullptr ? local : src;
+}
+
+/** Promote GlobalRef to a Local for stash / Throw; deletes Global only on success. */
+static jobject global_to_local(JNIEnv* env, jobject global) {
+    if (global == nullptr) {
+        return nullptr;
+    }
+    jobject local = env->NewLocalRef(global);
+    if (local == nullptr) {
+        return nullptr;  // keep Global so caller can retry or release_ref
+    }
+    env->DeleteGlobalRef(global);
+    return local;
+}
+
+static void throw_arith(JNIEnv* env, const char* msg);
+static void throw_runtime(JNIEnv* env, const char* msg);
+static void throw_npe(JNIEnv* env, const char* msg);
+static void throw_cce(JNIEnv* env, const char* msg);
+static void throw_security(JNIEnv* env, const char* msg);
+static bool ensure_well_known_classes(JNIEnv* env);
 
 static int16_t read_i16(const uint8_t* p) {
     int16_t v;
@@ -46,6 +179,11 @@ static int64_t read_i64(const uint8_t* p) {
     int64_t v;
     memcpy(&v, p, 8);
     return v;
+}
+
+static int64_t imm_key64(int32_t key) {
+    uint32_t k = static_cast<uint32_t>(key);
+    return static_cast<int64_t>((static_cast<uint64_t>(k) << 32) | k);
 }
 
 static uint16_t read_u16(const uint8_t* p) {
@@ -66,6 +204,68 @@ static bool cmp_i32(int cond, int32_t a, int32_t b) {
     }
 }
 
+static void reg_drop_obj(JNIEnv* env, Reg* r) {
+    jobject o = r->o;
+    if (o == nullptr) {
+        return;
+    }
+    bool g = r->o_global;
+    r->o = nullptr;
+    r->o_global = false;
+    release_ref(env, o, g);
+}
+
+static void reg_as_i(JNIEnv* env, Reg* r) {
+    reg_drop_obj(env, r);
+    r->k = RK_I;
+}
+
+static void reg_as_j(JNIEnv* env, Reg* r) {
+    reg_drop_obj(env, r);
+    r->k = RK_J;
+}
+
+/** Take ownership of jobject into register (object kind). */
+static void reg_take_o(JNIEnv* env, Reg* r, jobject o, bool o_global = false) {
+    jobject old = r->o;
+    bool old_global = r->o_global;
+    r->o = o;
+    r->o_global = o_global;
+    r->i = 0;
+    r->k = RK_L;
+    if (old != nullptr && old != o) {
+        release_ref(env, old, old_global);
+    }
+}
+
+/** if-eqz / if-nez: objects use nullness of .o; ints use .i. */
+static bool eval_if_z(int cond, const Reg& a) {
+    if (a.k == RK_L) {
+        if (cond == COND_EQ) {
+            return a.o == nullptr;
+        }
+        if (cond == COND_NE) {
+            return a.o != nullptr;
+        }
+        return false;
+    }
+    return cmp_i32(cond, a.i, 0);
+}
+
+/** if-eq / if-ne on refs → IsSameObject; relational ops stay int-only. */
+static bool eval_if_cmp(JNIEnv* env, int cond, const Reg& a, const Reg& b) {
+    if (a.k == RK_L || b.k == RK_L) {
+        if (cond == COND_EQ) {
+            return env->IsSameObject(a.o, b.o) == JNI_TRUE;
+        }
+        if (cond == COND_NE) {
+            return env->IsSameObject(a.o, b.o) != JNI_TRUE;
+        }
+        return false;
+    }
+    return cmp_i32(cond, a.i, b.i);
+}
+
 static bool binop_i32(JNIEnv* env, int op, int32_t a, int32_t b, int32_t* out) {
     switch (op) {
         case BIN_ADD: *out = a + b; return true;
@@ -81,7 +281,7 @@ static bool binop_i32(JNIEnv* env, int op, int32_t a, int32_t b, int32_t* out) {
             return true;
         case BIN_DIV:
             if (b == 0) {
-                env->ThrowNew(env->FindClass("java/lang/ArithmeticException"), "/ by zero");
+                throw_arith(env, "/ by zero");
                 return false;
             }
             // Dalvik: INT_MIN / -1 == INT_MIN
@@ -93,7 +293,7 @@ static bool binop_i32(JNIEnv* env, int op, int32_t a, int32_t b, int32_t* out) {
             return true;
         case BIN_REM:
             if (b == 0) {
-                env->ThrowNew(env->FindClass("java/lang/ArithmeticException"), "/ by zero");
+                throw_arith(env, "/ by zero");
                 return false;
             }
             if (a == static_cast<int32_t>(0x80000000) && b == -1) {
@@ -123,7 +323,7 @@ static bool binop_i64(JNIEnv* env, int op, int64_t a, int64_t b, int64_t* out) {
             return true;
         case BIN_DIV:
             if (b == 0) {
-                env->ThrowNew(env->FindClass("java/lang/ArithmeticException"), "/ by zero");
+                throw_arith(env, "/ by zero");
                 return false;
             }
             if (a == std::numeric_limits<int64_t>::min() && b == -1) {
@@ -134,7 +334,7 @@ static bool binop_i64(JNIEnv* env, int op, int64_t a, int64_t b, int64_t* out) {
             return true;
         case BIN_REM:
             if (b == 0) {
-                env->ThrowNew(env->FindClass("java/lang/ArithmeticException"), "/ by zero");
+                throw_arith(env, "/ by zero");
                 return false;
             }
             if (a == std::numeric_limits<int64_t>::min() && b == -1) {
@@ -340,20 +540,42 @@ static bool apply_unop(int kind, Reg* dst, const Reg& src) {
 }
 
 static void clear_regs(JNIEnv* env, std::vector<Reg>& regs) {
-    for (auto& r : regs) {
-        if (r.o != nullptr) {
-            env->DeleteLocalRef(r.o);
-            r.o = nullptr;
+    // Dedup before Delete*: move-object / OEM NewLocalRef may leave the same
+    // jobject cookie in multiple regs; deleting twice aborts with "stale Local".
+    // scrub_ref_aliases also clears outer nested interpret frames.
+    for (size_t i = 0; i < regs.size(); ++i) {
+        jobject o = regs[i].o;
+        if (o == nullptr) {
+            continue;
+        }
+        bool g = regs[i].o_global;
+        regs[i].o = nullptr;
+        regs[i].o_global = false;
+        for (size_t j = i + 1; j < regs.size(); ++j) {
+            if (regs[j].o == o) {
+                regs[j].o = nullptr;
+                regs[j].o_global = false;
+            }
+        }
+        scrub_ref_aliases(o);
+        if (g) {
+            env->DeleteGlobalRef(o);
+        } else {
+            env->DeleteLocalRef(o);
         }
     }
 }
 
 static void clear_pending(JNIEnv* env, PendingResult& pending) {
     if (pending.o != nullptr) {
-        env->DeleteLocalRef(pending.o);
+        jobject o = pending.o;
+        bool g = pending.o_global;
         pending.o = nullptr;
+        pending.o_global = false;
+        release_ref(env, o, g);
     }
     pending.valid = false;
+    pending.k = RK_I;
 }
 
 static std::string descriptor_to_jni(const std::string& desc) {
@@ -363,8 +585,228 @@ static std::string descriptor_to_jni(const std::string& desc) {
     return desc;
 }
 
+// ---------------------------------------------------------------------------
+// JNI Local / Global management (L1 ownership + L2 frames + L3 capacity/cache)
+// ---------------------------------------------------------------------------
+
+/** RAII PushLocalFrame. pop(result) promotes a local out; otherwise dtor discards. */
+struct JniLocalFrame {
+    JNIEnv* env = nullptr;
+    bool active = false;
+
+    JniLocalFrame(JNIEnv* e, jint capacity) : env(e) {
+        if (env != nullptr && env->PushLocalFrame(capacity) == 0) {
+            active = true;
+        }
+    }
+
+    jobject pop(jobject result) {
+        if (!active) {
+            return result;
+        }
+        active = false;
+        return env->PopLocalFrame(result);
+    }
+
+    ~JniLocalFrame() {
+        if (active) {
+            env->PopLocalFrame(nullptr);
+        }
+    }
+
+    JniLocalFrame(const JniLocalFrame&) = delete;
+    JniLocalFrame& operator=(const JniLocalFrame&) = delete;
+};
+
+struct JniClassCache {
+    std::mutex mu;
+    std::unordered_map<std::string, jclass> by_name;  // GlobalRef values
+
+    jclass arithmetic_ex = nullptr;
+    jclass runtime_ex = nullptr;
+    jclass npe = nullptr;
+    jclass cce = nullptr;
+    jclass security_ex = nullptr;
+    jclass integer_cls = nullptr;
+    jclass long_cls = nullptr;
+    jclass boolean_cls = nullptr;
+    jclass float_cls = nullptr;
+    jclass double_cls = nullptr;
+    jclass float_arr = nullptr;
+    jclass double_arr = nullptr;
+    jclass bool_arr = nullptr;
+    jclass char_arr = nullptr;
+
+    jmethodID integer_valueOf = nullptr;
+    jmethodID long_valueOf = nullptr;
+    jmethodID boolean_valueOf = nullptr;
+    jmethodID float_valueOf = nullptr;
+    jmethodID double_valueOf = nullptr;
+    jmethodID integer_intValue = nullptr;
+    jmethodID long_longValue = nullptr;
+    jmethodID boolean_booleanValue = nullptr;
+    jmethodID float_floatValue = nullptr;
+    jmethodID double_doubleValue = nullptr;
+
+    std::atomic<bool> well_known_ready{false};
+};
+
+static JniClassCache& jni_cache() {
+    static JniClassCache cache;
+    return cache;
+}
+
+/** Cache FindClass as GlobalRef. Returned jclass must NOT be DeleteLocalRef'd. */
+static jclass cache_global_class(JNIEnv* env, const char* jni_name) {
+    if (env == nullptr || jni_name == nullptr) {
+        return nullptr;
+    }
+    auto& cache = jni_cache();
+    {
+        std::lock_guard<std::mutex> lock(cache.mu);
+        auto it = cache.by_name.find(jni_name);
+        if (it != cache.by_name.end()) {
+            return it->second;
+        }
+    }
+    jclass local = env->FindClass(jni_name);
+    if (local == nullptr) {
+        return nullptr;
+    }
+    jclass global = reinterpret_cast<jclass>(env->NewGlobalRef(local));
+    env->DeleteLocalRef(local);
+    if (global == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(cache.mu);
+    auto it = cache.by_name.find(jni_name);
+    if (it != cache.by_name.end()) {
+        env->DeleteGlobalRef(global);
+        return it->second;
+    }
+    cache.by_name.emplace(jni_name, global);
+    return global;
+}
+
+static bool ensure_well_known_classes(JNIEnv* env) {
+    auto& c = jni_cache();
+    if (c.well_known_ready.load(std::memory_order_acquire)) {
+        return true;
+    }
+
+    // Resolve classes WITHOUT holding c.mu — FindClass may re-enter app code.
+    jclass arithmetic_ex = cache_global_class(env, "java/lang/ArithmeticException");
+    jclass runtime_ex = cache_global_class(env, "java/lang/RuntimeException");
+    jclass npe = cache_global_class(env, "java/lang/NullPointerException");
+    jclass cce = cache_global_class(env, "java/lang/ClassCastException");
+    jclass security_ex = cache_global_class(env, "java/lang/SecurityException");
+    jclass integer_cls = cache_global_class(env, "java/lang/Integer");
+    jclass long_cls = cache_global_class(env, "java/lang/Long");
+    jclass boolean_cls = cache_global_class(env, "java/lang/Boolean");
+    jclass float_cls = cache_global_class(env, "java/lang/Float");
+    jclass double_cls = cache_global_class(env, "java/lang/Double");
+    jclass float_arr = cache_global_class(env, "[F");
+    jclass double_arr = cache_global_class(env, "[D");
+    jclass bool_arr = cache_global_class(env, "[Z");
+    jclass char_arr = cache_global_class(env, "[C");
+
+    if (integer_cls == nullptr || long_cls == nullptr || boolean_cls == nullptr
+            || float_cls == nullptr || double_cls == nullptr
+            || arithmetic_ex == nullptr || runtime_ex == nullptr
+            || npe == nullptr || cce == nullptr || security_ex == nullptr) {
+        return false;
+    }
+
+    jmethodID integer_valueOf = env->GetStaticMethodID(integer_cls, "valueOf", "(I)Ljava/lang/Integer;");
+    jmethodID long_valueOf = env->GetStaticMethodID(long_cls, "valueOf", "(J)Ljava/lang/Long;");
+    jmethodID boolean_valueOf = env->GetStaticMethodID(boolean_cls, "valueOf", "(Z)Ljava/lang/Boolean;");
+    jmethodID float_valueOf = env->GetStaticMethodID(float_cls, "valueOf", "(F)Ljava/lang/Float;");
+    jmethodID double_valueOf = env->GetStaticMethodID(double_cls, "valueOf", "(D)Ljava/lang/Double;");
+    jmethodID integer_intValue = env->GetMethodID(integer_cls, "intValue", "()I");
+    jmethodID long_longValue = env->GetMethodID(long_cls, "longValue", "()J");
+    jmethodID boolean_booleanValue = env->GetMethodID(boolean_cls, "booleanValue", "()Z");
+    jmethodID float_floatValue = env->GetMethodID(float_cls, "floatValue", "()F");
+    jmethodID double_doubleValue = env->GetMethodID(double_cls, "doubleValue", "()D");
+
+    if (integer_valueOf == nullptr || long_valueOf == nullptr || boolean_valueOf == nullptr
+            || float_valueOf == nullptr || double_valueOf == nullptr
+            || integer_intValue == nullptr || long_longValue == nullptr
+            || boolean_booleanValue == nullptr || float_floatValue == nullptr
+            || double_doubleValue == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(c.mu);
+    if (c.well_known_ready.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    c.arithmetic_ex = arithmetic_ex;
+    c.runtime_ex = runtime_ex;
+    c.npe = npe;
+    c.cce = cce;
+    c.security_ex = security_ex;
+    c.integer_cls = integer_cls;
+    c.long_cls = long_cls;
+    c.boolean_cls = boolean_cls;
+    c.float_cls = float_cls;
+    c.double_cls = double_cls;
+    c.float_arr = float_arr;
+    c.double_arr = double_arr;
+    c.bool_arr = bool_arr;
+    c.char_arr = char_arr;
+    c.integer_valueOf = integer_valueOf;
+    c.long_valueOf = long_valueOf;
+    c.boolean_valueOf = boolean_valueOf;
+    c.float_valueOf = float_valueOf;
+    c.double_valueOf = double_valueOf;
+    c.integer_intValue = integer_intValue;
+    c.long_longValue = long_longValue;
+    c.boolean_booleanValue = boolean_booleanValue;
+    c.float_floatValue = float_floatValue;
+    c.double_doubleValue = double_doubleValue;
+    c.well_known_ready.store(true, std::memory_order_release);
+    return true;
+}
+
+/** Descriptor or internal name → GlobalRef jclass. Do NOT DeleteLocalRef. */
 static jclass find_class_desc(JNIEnv* env, const std::string& desc) {
-    return env->FindClass(descriptor_to_jni(desc).c_str());
+    return cache_global_class(env, descriptor_to_jni(desc).c_str());
+}
+
+static jclass find_jni_class(JNIEnv* env, const char* jni_name) {
+    return cache_global_class(env, jni_name);
+}
+
+static void throw_cached(JNIEnv* env, jclass ex_cls, const char* msg) {
+    if (ex_cls != nullptr) {
+        env->ThrowNew(ex_cls, msg);
+        return;
+    }
+    jclass local = env->FindClass("java/lang/RuntimeException");
+    if (local != nullptr) {
+        env->ThrowNew(local, msg != nullptr ? msg : "VMP error");
+        env->DeleteLocalRef(local);
+    }
+}
+
+static void throw_arith(JNIEnv* env, const char* msg) {
+    throw_cached(env, jni_cache().arithmetic_ex, msg);
+}
+
+static void throw_runtime(JNIEnv* env, const char* msg) {
+    throw_cached(env, jni_cache().runtime_ex, msg);
+}
+
+static void throw_npe(JNIEnv* env, const char* msg) {
+    throw_cached(env, jni_cache().npe, msg);
+}
+
+static void throw_cce(JNIEnv* env, const char* msg) {
+    throw_cached(env, jni_cache().cce, msg);
+}
+
+static void throw_security(JNIEnv* env, const char* msg) {
+    throw_cached(env, jni_cache().security_ex, msg);
 }
 
 static bool parse_member_ref(const std::string& s, std::string* owner,
@@ -440,88 +882,79 @@ static bool reg_bounds_wide(uint8_t r, size_t reg_count) {
 }
 
 static jobject box_int(JNIEnv* env, int32_t v) {
-    jclass cls = env->FindClass("java/lang/Integer");
-    if (!cls) return nullptr;
-    jmethodID mid = env->GetStaticMethodID(cls, "valueOf", "(I)Ljava/lang/Integer;");
-    if (!mid) return nullptr;
-    return env->CallStaticObjectMethod(cls, mid, v);
+    auto& c = jni_cache();
+    if (!ensure_well_known_classes(env)) return nullptr;
+    return env->CallStaticObjectMethod(c.integer_cls, c.integer_valueOf, v);
 }
 
 static jobject box_long(JNIEnv* env, int64_t v) {
-    jclass cls = env->FindClass("java/lang/Long");
-    if (!cls) return nullptr;
-    jmethodID mid = env->GetStaticMethodID(cls, "valueOf", "(J)Ljava/lang/Long;");
-    if (!mid) return nullptr;
-    return env->CallStaticObjectMethod(cls, mid, v);
+    auto& c = jni_cache();
+    if (!ensure_well_known_classes(env)) return nullptr;
+    return env->CallStaticObjectMethod(c.long_cls, c.long_valueOf, v);
 }
 
 static jobject box_bool(JNIEnv* env, bool v) {
-    jclass cls = env->FindClass("java/lang/Boolean");
-    if (!cls) return nullptr;
-    jmethodID mid = env->GetStaticMethodID(cls, "valueOf", "(Z)Ljava/lang/Boolean;");
-    if (!mid) return nullptr;
-    return env->CallStaticObjectMethod(cls, mid, v ? JNI_TRUE : JNI_FALSE);
+    auto& c = jni_cache();
+    if (!ensure_well_known_classes(env)) return nullptr;
+    return env->CallStaticObjectMethod(c.boolean_cls, c.boolean_valueOf, v ? JNI_TRUE : JNI_FALSE);
 }
 
 static jobject box_float(JNIEnv* env, jfloat v) {
-    jclass cls = env->FindClass("java/lang/Float");
-    if (!cls) return nullptr;
-    jmethodID mid = env->GetStaticMethodID(cls, "valueOf", "(F)Ljava/lang/Float;");
-    if (!mid) return nullptr;
-    return env->CallStaticObjectMethod(cls, mid, v);
+    auto& c = jni_cache();
+    if (!ensure_well_known_classes(env)) return nullptr;
+    return env->CallStaticObjectMethod(c.float_cls, c.float_valueOf, v);
 }
 
 static jobject box_double(JNIEnv* env, jdouble v) {
-    jclass cls = env->FindClass("java/lang/Double");
-    if (!cls) return nullptr;
-    jmethodID mid = env->GetStaticMethodID(cls, "valueOf", "(D)Ljava/lang/Double;");
-    if (!mid) return nullptr;
-    return env->CallStaticObjectMethod(cls, mid, v);
+    auto& c = jni_cache();
+    if (!ensure_well_known_classes(env)) return nullptr;
+    return env->CallStaticObjectMethod(c.double_cls, c.double_valueOf, v);
 }
 
 static bool unbox_arg(JNIEnv* env, jobject obj, const char* expected, Reg* out) {
     if (expected[0] == 'L' || expected[0] == '[') {
-        out->o = obj ? env->NewLocalRef(obj) : nullptr;
+        bool g = false;
+        jobject copy = obj ? dup_owned_ref(env, obj, &g) : nullptr;
+        reg_take_o(env, out, copy, g);
         return true;
     }
     if (obj == nullptr) {
         return false;
     }
+    if (!ensure_well_known_classes(env)) {
+        return false;
+    }
+    auto& c = jni_cache();
     switch (expected[0]) {
         case 'I':
         case 'B':
         case 'S':
         case 'C': {
-            jclass cls = env->FindClass("java/lang/Integer");
-            jmethodID mid = env->GetMethodID(cls, "intValue", "()I");
-            out->i = env->CallIntMethod(obj, mid);
+            reg_as_i(env, out);
+            out->i = env->CallIntMethod(obj, c.integer_intValue);
             return !env->ExceptionCheck();
         }
         case 'Z': {
-            jclass cls = env->FindClass("java/lang/Boolean");
-            jmethodID mid = env->GetMethodID(cls, "booleanValue", "()Z");
-            out->i = env->CallBooleanMethod(obj, mid) ? 1 : 0;
+            reg_as_i(env, out);
+            out->i = env->CallBooleanMethod(obj, c.boolean_booleanValue) ? 1 : 0;
             return !env->ExceptionCheck();
         }
         case 'J': {
-            jclass cls = env->FindClass("java/lang/Long");
-            jmethodID mid = env->GetMethodID(cls, "longValue", "()J");
-            out->j = env->CallLongMethod(obj, mid);
+            reg_as_j(env, out);
+            out->j = env->CallLongMethod(obj, c.long_longValue);
             return !env->ExceptionCheck();
         }
         case 'F': {
-            jclass cls = env->FindClass("java/lang/Float");
-            jmethodID mid = env->GetMethodID(cls, "floatValue", "()F");
-            jfloat f = env->CallFloatMethod(obj, mid);
+            jfloat f = env->CallFloatMethod(obj, c.float_floatValue);
             if (env->ExceptionCheck()) return false;
+            reg_as_i(env, out);
             memcpy(&out->i, &f, sizeof(f));
             return true;
         }
         case 'D': {
-            jclass cls = env->FindClass("java/lang/Double");
-            jmethodID mid = env->GetMethodID(cls, "doubleValue", "()D");
-            jdouble d = env->CallDoubleMethod(obj, mid);
+            jdouble d = env->CallDoubleMethod(obj, c.double_doubleValue);
             if (env->ExceptionCheck()) return false;
+            reg_as_j(env, out);
             memcpy(&out->j, &d, sizeof(d));
             return true;
         }
@@ -607,6 +1040,11 @@ static bool fill_jargs(const char* sig, const uint8_t* arg_regs, uint8_t argc,
 static bool invoke_method(JNIEnv* env, uint8_t op, const std::string& desc,
                           const uint8_t* arg_regs, uint8_t argc,
                           const std::vector<Reg>& regs, PendingResult& pending) {
+    // Outer locals (pending/regs) must be DeleteLocalRef'd ONLY while no inner
+    // PushLocalFrame is active — otherwise ART reports
+    // "Attempt to remove index outside index area" / DeleteLocalRef failed.
+    clear_pending(env, pending);
+
     std::string owner;
     std::string name;
     std::string sig;
@@ -626,8 +1064,21 @@ static bool invoke_method(JNIEnv* env, uint8_t op, const std::string& desc,
 
     const uint8_t* param_regs = arg_regs;
     uint8_t param_regc = argc;
+    jobject thiz = nullptr;
     if (op != OP_INVOKE_STATIC) {
         if (argc == 0) {
+            throw_runtime(env, "VMP invoke missing receiver");
+            return false;
+        }
+        uint8_t recv = arg_regs[0];
+        if (!reg_bounds(recv, regs.size())) {
+            return false;
+        }
+        thiz = regs[recv].o;
+        // CheckJNI aborts on Call*MethodA(null, ...); match Dalvik and throw NPE.
+        // Throw BEFORE PushLocalFrame so the exception local is not discarded by Pop.
+        if (thiz == nullptr) {
+            throw_npe(env, "VMP invoke on null");
             return false;
         }
         param_regs = arg_regs + 1;
@@ -645,7 +1096,22 @@ static bool invoke_method(JNIEnv* env, uint8_t op, const std::string& desc,
     }
 
     const char* ret = return_type_of_sig(sig.c_str());
-    clear_pending(env, pending);
+
+    // Frame scopes Call* locals only; object results promoted via pop() to outer table.
+    JniLocalFrame frame(env, 64);
+
+    auto finish_object = [&](jobject v) -> bool {
+        if (env->ExceptionCheck()) {
+            return false;
+        }
+        pending.valid = true;
+        // Take Call* ownership and promote out of the local frame.
+        pending.o = frame.pop(v);
+        pending.o_global = false;
+        pending.k = RK_L;
+        pending.i = 0;
+        return true;
+    };
 
     if (op == OP_INVOKE_STATIC) {
         switch (ret[0]) {
@@ -710,25 +1176,12 @@ static bool invoke_method(JNIEnv* env, uint8_t op, const std::string& desc,
             }
             default: {
                 jobject v = env->CallStaticObjectMethodA(cls, mid, args);
-                if (env->ExceptionCheck()) return false;
-                pending.valid = true;
-                pending.o = v ? env->NewLocalRef(v) : nullptr;
-                return true;
+                return finish_object(v);
             }
         }
     }
 
-    if (argc == 0) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP invoke missing receiver");
-        return false;
-    }
-    uint8_t recv = arg_regs[0];
-    if (!reg_bounds(recv, regs.size())) {
-        return false;
-    }
-    jobject thiz = regs[recv].o;
-
-    if (op == OP_INVOKE_SUPER) {
+    if (op == OP_INVOKE_SUPER || op == OP_INVOKE_DIRECT) {
         switch (ret[0]) {
             case 'V':
                 env->CallNonvirtualVoidMethodA(thiz, cls, mid, args);
@@ -791,10 +1244,7 @@ static bool invoke_method(JNIEnv* env, uint8_t op, const std::string& desc,
             }
             default: {
                 jobject v = env->CallNonvirtualObjectMethodA(thiz, cls, mid, args);
-                if (env->ExceptionCheck()) return false;
-                pending.valid = true;
-                pending.o = v ? env->NewLocalRef(v) : nullptr;
-                return true;
+                return finish_object(v);
             }
         }
     }
@@ -861,10 +1311,7 @@ static bool invoke_method(JNIEnv* env, uint8_t op, const std::string& desc,
         }
         default: {
             jobject v = env->CallObjectMethodA(thiz, mid, args);
-            if (env->ExceptionCheck()) return false;
-            pending.valid = true;
-            pending.o = v ? env->NewLocalRef(v) : nullptr;
-            return true;
+            return finish_object(v);
         }
     }
 }
@@ -889,6 +1336,7 @@ static bool get_static_field(JNIEnv* env, const std::string& desc, uint8_t kind,
     }
     switch (kind) {
         case KIND_I:
+            reg_as_i(env, dst);
             if (type == "F") {
                 jfloat f = env->GetStaticFloatField(cls, fid);
                 if (env->ExceptionCheck()) return false;
@@ -898,6 +1346,7 @@ static bool get_static_field(JNIEnv* env, const std::string& desc, uint8_t kind,
             dst->i = env->GetStaticIntField(cls, fid);
             return !env->ExceptionCheck();
         case KIND_J:
+            reg_as_j(env, dst);
             if (type == "D") {
                 jdouble d = env->GetStaticDoubleField(cls, fid);
                 if (env->ExceptionCheck()) return false;
@@ -907,22 +1356,31 @@ static bool get_static_field(JNIEnv* env, const std::string& desc, uint8_t kind,
             dst->j = env->GetStaticLongField(cls, fid);
             return !env->ExceptionCheck();
         case KIND_Z:
+            reg_as_i(env, dst);
             dst->i = env->GetStaticBooleanField(cls, fid) ? 1 : 0;
             return !env->ExceptionCheck();
         case KIND_B:
+            reg_as_i(env, dst);
             dst->i = env->GetStaticByteField(cls, fid);
             return !env->ExceptionCheck();
         case KIND_S:
+            reg_as_i(env, dst);
             dst->i = env->GetStaticShortField(cls, fid);
             return !env->ExceptionCheck();
         case KIND_C:
+            reg_as_i(env, dst);
             dst->i = env->GetStaticCharField(cls, fid);
             return !env->ExceptionCheck();
-        case KIND_L:
-            if (dst->o) env->DeleteLocalRef(dst->o);
-            dst->o = env->GetStaticObjectField(cls, fid);
-            if (dst->o) dst->o = env->NewLocalRef(dst->o);
-            return !env->ExceptionCheck();
+        case KIND_L: {
+            // reg_take_o skips Delete when old==got (sget into a reg that already holds
+            // the same cookie) and clears ownership atomically — avoids stale Local.
+            jobject got = env->GetStaticObjectField(cls, fid);
+            if (env->ExceptionCheck()) {
+                return false;
+            }
+            reg_take_o(env, dst, got);
+            return true;
+        }
         default:
             return false;
     }
@@ -987,6 +1445,10 @@ static bool put_static_field(JNIEnv* env, const std::string& desc, uint8_t kind,
 
 static bool get_instance_field(JNIEnv* env, const std::string& desc, uint8_t kind,
                                jobject obj, Reg* dst) {
+    if (obj == nullptr) {
+        throw_npe(env, "iget on null");
+        return false;
+    }
     std::string owner;
     std::string name;
     std::string type;
@@ -1004,42 +1466,76 @@ static bool get_instance_field(JNIEnv* env, const std::string& desc, uint8_t kin
     if (fid == nullptr) {
         return false;
     }
+    // IMPORTANT: do NOT reg_as_i/j(dst) before Get*Field — dst may alias the
+    // object register (iget v0, v0, Field). Dropping dst first deletes the live
+    // object local → GetIntField SIGSEGV (fault 0xb1). Seen on Alipay m.u.n.f.
     switch (kind) {
-        case KIND_I:
+        case KIND_I: {
             if (type == "F") {
                 jfloat f = env->GetFloatField(obj, fid);
                 if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
                 memcpy(&dst->i, &f, sizeof(f));
                 return true;
             }
-            dst->i = env->GetIntField(obj, fid);
-            return !env->ExceptionCheck();
-        case KIND_J:
+            jint v = env->GetIntField(obj, fid);
+            if (env->ExceptionCheck()) return false;
+            reg_as_i(env, dst);
+            dst->i = v;
+            return true;
+        }
+        case KIND_J: {
             if (type == "D") {
                 jdouble d = env->GetDoubleField(obj, fid);
                 if (env->ExceptionCheck()) return false;
+                reg_as_j(env, dst);
                 memcpy(&dst->j, &d, sizeof(d));
                 return true;
             }
-            dst->j = env->GetLongField(obj, fid);
-            return !env->ExceptionCheck();
-        case KIND_Z:
-            dst->i = env->GetBooleanField(obj, fid) ? 1 : 0;
-            return !env->ExceptionCheck();
-        case KIND_B:
-            dst->i = env->GetByteField(obj, fid);
-            return !env->ExceptionCheck();
-        case KIND_S:
-            dst->i = env->GetShortField(obj, fid);
-            return !env->ExceptionCheck();
-        case KIND_C:
-            dst->i = env->GetCharField(obj, fid);
-            return !env->ExceptionCheck();
-        case KIND_L:
-            if (dst->o) env->DeleteLocalRef(dst->o);
-            dst->o = env->GetObjectField(obj, fid);
-            if (dst->o) dst->o = env->NewLocalRef(dst->o);
-            return !env->ExceptionCheck();
+            jlong v = env->GetLongField(obj, fid);
+            if (env->ExceptionCheck()) return false;
+            reg_as_j(env, dst);
+            dst->j = v;
+            return true;
+        }
+        case KIND_Z: {
+            jboolean v = env->GetBooleanField(obj, fid);
+            if (env->ExceptionCheck()) return false;
+            reg_as_i(env, dst);
+            dst->i = v ? 1 : 0;
+            return true;
+        }
+        case KIND_B: {
+            jbyte v = env->GetByteField(obj, fid);
+            if (env->ExceptionCheck()) return false;
+            reg_as_i(env, dst);
+            dst->i = v;
+            return true;
+        }
+        case KIND_S: {
+            jshort v = env->GetShortField(obj, fid);
+            if (env->ExceptionCheck()) return false;
+            reg_as_i(env, dst);
+            dst->i = v;
+            return true;
+        }
+        case KIND_C: {
+            jchar v = env->GetCharField(obj, fid);
+            if (env->ExceptionCheck()) return false;
+            reg_as_i(env, dst);
+            dst->i = v;
+            return true;
+        }
+        case KIND_L: {
+            // Get first — dst may alias obj (iget-object vX, vX, field).
+            // reg_take_o skips Delete when old==got (same cookie / OEM NewLocalRef).
+            jobject got = env->GetObjectField(obj, fid);
+            if (env->ExceptionCheck()) {
+                return false;
+            }
+            reg_take_o(env, dst, got);
+            return true;
+        }
         default:
             return false;
     }
@@ -1047,6 +1543,10 @@ static bool get_instance_field(JNIEnv* env, const std::string& desc, uint8_t kin
 
 static bool put_instance_field(JNIEnv* env, const std::string& desc, uint8_t kind,
                                jobject obj, const Reg& src) {
+    if (obj == nullptr) {
+        throw_npe(env, "iput on null");
+        return false;
+    }
     std::string owner;
     std::string name;
     std::string type;
@@ -1128,71 +1628,166 @@ static uint8_t kind_of_array_type(const std::string& type) {
 }
 
 static bool aget(JNIEnv* env, jarray arr, int32_t idx, uint8_t kind, Reg* dst) {
+    if (arr == nullptr) {
+        throw_npe(env, "aget on null");
+        return false;
+    }
+    auto& c = jni_cache();
+    // IMPORTANT: do NOT reg_as_i/j(dst) before reading arr — dst may alias the
+    // array register (aget v0, v0, v1). Dropping dst first deletes the live array
+    // local → IsInstanceOf/Get*ArrayRegion SIGSEGV (fault 0x31). Seen on Alipay
+    // m.u.j → m.n.a under nested True-VMP.
     switch (kind) {
         case KIND_I: {
-            // Float arrays share Dalvik aget with int — discriminate via runtime type.
-            jclass floatArrCls = env->FindClass("[F");
+            jfloat fv;
+            jint iv;
+            jclass floatArrCls = c.float_arr != nullptr ? c.float_arr : find_jni_class(env, "[F");
             if (floatArrCls != nullptr && env->IsInstanceOf(arr, floatArrCls)) {
-                jfloat v;
-                env->GetFloatArrayRegion(static_cast<jfloatArray>(arr), idx, 1, &v);
+                env->GetFloatArrayRegion(static_cast<jfloatArray>(arr), idx, 1, &fv);
                 if (env->ExceptionCheck()) return false;
-                memcpy(&dst->i, &v, sizeof(v));
+                reg_as_i(env, dst);
+                memcpy(&dst->i, &fv, sizeof(fv));
                 return true;
             }
-            jint v;
-            env->GetIntArrayRegion(static_cast<jintArray>(arr), idx, 1, &v);
-            dst->i = v;
-            return !env->ExceptionCheck();
+            jclass intArrCls = find_jni_class(env, "[I");
+            if (intArrCls == nullptr || !env->IsInstanceOf(arr, intArrCls)) {
+                throw_cce(env, "aget int/float bad array");
+                return false;
+            }
+            env->GetIntArrayRegion(static_cast<jintArray>(arr), idx, 1, &iv);
+            if (env->ExceptionCheck()) return false;
+            reg_as_i(env, dst);
+            dst->i = iv;
+            return true;
         }
         case KIND_J: {
-            jclass doubleArrCls = env->FindClass("[D");
+            jdouble dv;
+            jlong lv;
+            jclass doubleArrCls = c.double_arr != nullptr ? c.double_arr : find_jni_class(env, "[D");
             if (doubleArrCls != nullptr && env->IsInstanceOf(arr, doubleArrCls)) {
-                jdouble v;
-                env->GetDoubleArrayRegion(static_cast<jdoubleArray>(arr), idx, 1, &v);
+                env->GetDoubleArrayRegion(static_cast<jdoubleArray>(arr), idx, 1, &dv);
                 if (env->ExceptionCheck()) return false;
-                memcpy(&dst->j, &v, sizeof(v));
+                reg_as_j(env, dst);
+                memcpy(&dst->j, &dv, sizeof(dv));
                 return true;
             }
-            jlong v;
-            env->GetLongArrayRegion(static_cast<jlongArray>(arr), idx, 1, &v);
-            dst->j = v;
-            return !env->ExceptionCheck();
+            jclass longArrCls = find_jni_class(env, "[J");
+            if (longArrCls == nullptr || !env->IsInstanceOf(arr, longArrCls)) {
+                throw_cce(env, "aget long/double bad array");
+                return false;
+            }
+            env->GetLongArrayRegion(static_cast<jlongArray>(arr), idx, 1, &lv);
+            if (env->ExceptionCheck()) return false;
+            reg_as_j(env, dst);
+            dst->j = lv;
+            return true;
         }
         case KIND_Z: {
-            jbooleanArray a = static_cast<jbooleanArray>(arr);
-            jboolean v;
-            env->GetBooleanArrayRegion(a, idx, 1, &v);
-            dst->i = v ? 1 : 0;
-            return !env->ExceptionCheck();
+            jboolean zv;
+            jbyte bv;
+            jclass boolArrCls = c.bool_arr != nullptr ? c.bool_arr : find_jni_class(env, "[Z");
+            if (boolArrCls != nullptr && env->IsInstanceOf(arr, boolArrCls)) {
+                env->GetBooleanArrayRegion(static_cast<jbooleanArray>(arr), idx, 1, &zv);
+                if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
+                dst->i = zv ? 1 : 0;
+                return true;
+            }
+            jclass byteArrCls = find_jni_class(env, "[B");
+            if (byteArrCls != nullptr && env->IsInstanceOf(arr, byteArrCls)) {
+                env->GetByteArrayRegion(static_cast<jbyteArray>(arr), idx, 1, &bv);
+                if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
+                dst->i = bv;
+                return true;
+            }
+            throw_cce(env, "aget-boolean bad array");
+            return false;
         }
         case KIND_B: {
-            jbyteArray a = static_cast<jbyteArray>(arr);
-            jbyte v;
-            env->GetByteArrayRegion(a, idx, 1, &v);
-            dst->i = v;
-            return !env->ExceptionCheck();
+            jboolean zv;
+            jbyte bv;
+            jclass boolArrCls = c.bool_arr != nullptr ? c.bool_arr : find_jni_class(env, "[Z");
+            if (boolArrCls != nullptr && env->IsInstanceOf(arr, boolArrCls)) {
+                env->GetBooleanArrayRegion(static_cast<jbooleanArray>(arr), idx, 1, &zv);
+                if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
+                dst->i = zv ? 1 : 0;
+                return true;
+            }
+            jclass byteArrCls = find_jni_class(env, "[B");
+            if (byteArrCls != nullptr && env->IsInstanceOf(arr, byteArrCls)) {
+                env->GetByteArrayRegion(static_cast<jbyteArray>(arr), idx, 1, &bv);
+                if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
+                dst->i = bv;
+                return true;
+            }
+            throw_cce(env, "aget-byte bad array");
+            return false;
         }
         case KIND_S: {
-            jshortArray a = static_cast<jshortArray>(arr);
-            jshort v;
-            env->GetShortArrayRegion(a, idx, 1, &v);
-            dst->i = v;
-            return !env->ExceptionCheck();
+            jchar cv;
+            jshort sv;
+            jclass charArrCls = c.char_arr != nullptr ? c.char_arr : find_jni_class(env, "[C");
+            if (charArrCls != nullptr && env->IsInstanceOf(arr, charArrCls)) {
+                env->GetCharArrayRegion(static_cast<jcharArray>(arr), idx, 1, &cv);
+                if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
+                dst->i = cv;
+                return true;
+            }
+            jclass shortArrCls = find_jni_class(env, "[S");
+            if (shortArrCls != nullptr && env->IsInstanceOf(arr, shortArrCls)) {
+                env->GetShortArrayRegion(static_cast<jshortArray>(arr), idx, 1, &sv);
+                if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
+                dst->i = sv;
+                return true;
+            }
+            throw_cce(env, "aget-short bad array");
+            return false;
         }
         case KIND_C: {
-            jcharArray a = static_cast<jcharArray>(arr);
-            jchar v;
-            env->GetCharArrayRegion(a, idx, 1, &v);
-            dst->i = v;
-            return !env->ExceptionCheck();
+            jchar cv;
+            jshort sv;
+            jbyte bv;
+            jclass charArrCls = c.char_arr != nullptr ? c.char_arr : find_jni_class(env, "[C");
+            if (charArrCls != nullptr && env->IsInstanceOf(arr, charArrCls)) {
+                env->GetCharArrayRegion(static_cast<jcharArray>(arr), idx, 1, &cv);
+                if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
+                dst->i = cv;
+                return true;
+            }
+            jclass shortArrCls = find_jni_class(env, "[S");
+            if (shortArrCls != nullptr && env->IsInstanceOf(arr, shortArrCls)) {
+                env->GetShortArrayRegion(static_cast<jshortArray>(arr), idx, 1, &sv);
+                if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
+                dst->i = static_cast<uint16_t>(sv);
+                return true;
+            }
+            jclass byteArrCls = find_jni_class(env, "[B");
+            if (byteArrCls != nullptr && env->IsInstanceOf(arr, byteArrCls)) {
+                env->GetByteArrayRegion(static_cast<jbyteArray>(arr), idx, 1, &bv);
+                if (env->ExceptionCheck()) return false;
+                reg_as_i(env, dst);
+                dst->i = static_cast<uint8_t>(bv);
+                return true;
+            }
+            throw_cce(env, "aget-char bad array");
+            return false;
         }
         case KIND_L: {
             jobjectArray a = static_cast<jobjectArray>(arr);
-            if (dst->o) env->DeleteLocalRef(dst->o);
-            jobject v = env->GetObjectArrayElement(a, idx);
-            dst->o = v ? env->NewLocalRef(v) : nullptr;
-            if (v) env->DeleteLocalRef(v);
-            return !env->ExceptionCheck();
+            // Get first — dst may alias the array register.
+            jobject got = env->GetObjectArrayElement(a, idx);
+            if (env->ExceptionCheck()) {
+                return false;
+            }
+            reg_take_o(env, dst, got);
+            return true;
         }
         default:
             return false;
@@ -1200,9 +1795,14 @@ static bool aget(JNIEnv* env, jarray arr, int32_t idx, uint8_t kind, Reg* dst) {
 }
 
 static bool aput(JNIEnv* env, jarray arr, int32_t idx, uint8_t kind, const Reg& src) {
+    if (arr == nullptr) {
+        throw_npe(env, "aput on null");
+        return false;
+    }
+    auto& c = jni_cache();
     switch (kind) {
         case KIND_I: {
-            jclass floatArrCls = env->FindClass("[F");
+            jclass floatArrCls = c.float_arr != nullptr ? c.float_arr : find_jni_class(env, "[F");
             if (floatArrCls != nullptr && env->IsInstanceOf(arr, floatArrCls)) {
                 jfloat v;
                 memcpy(&v, &src.i, sizeof(v));
@@ -1214,7 +1814,7 @@ static bool aput(JNIEnv* env, jarray arr, int32_t idx, uint8_t kind, const Reg& 
             return !env->ExceptionCheck();
         }
         case KIND_J: {
-            jclass doubleArrCls = env->FindClass("[D");
+            jclass doubleArrCls = c.double_arr != nullptr ? c.double_arr : find_jni_class(env, "[D");
             if (doubleArrCls != nullptr && env->IsInstanceOf(arr, doubleArrCls)) {
                 jdouble v;
                 memcpy(&v, &src.j, sizeof(v));
@@ -1231,18 +1831,43 @@ static bool aput(JNIEnv* env, jarray arr, int32_t idx, uint8_t kind, const Reg& 
             return !env->ExceptionCheck();
         }
         case KIND_B: {
-            jbyte v = static_cast<jbyte>(src.i);
-            env->SetByteArrayRegion(static_cast<jbyteArray>(arr), idx, 1, &v);
+            jclass boolArrCls = c.bool_arr != nullptr ? c.bool_arr : find_jni_class(env, "[Z");
+            if (boolArrCls != nullptr && env->IsInstanceOf(arr, boolArrCls)) {
+                jboolean v = src.i != 0 ? JNI_TRUE : JNI_FALSE;
+                env->SetBooleanArrayRegion(static_cast<jbooleanArray>(arr), idx, 1, &v);
+            } else {
+                jbyte v = static_cast<jbyte>(src.i);
+                env->SetByteArrayRegion(static_cast<jbyteArray>(arr), idx, 1, &v);
+            }
             return !env->ExceptionCheck();
         }
         case KIND_S: {
-            jshort v = static_cast<jshort>(src.i);
-            env->SetShortArrayRegion(static_cast<jshortArray>(arr), idx, 1, &v);
+            jclass charArrCls = c.char_arr != nullptr ? c.char_arr : find_jni_class(env, "[C");
+            if (charArrCls != nullptr && env->IsInstanceOf(arr, charArrCls)) {
+                jchar v = static_cast<jchar>(src.i);
+                env->SetCharArrayRegion(static_cast<jcharArray>(arr), idx, 1, &v);
+            } else {
+                jshort v = static_cast<jshort>(src.i);
+                env->SetShortArrayRegion(static_cast<jshortArray>(arr), idx, 1, &v);
+            }
             return !env->ExceptionCheck();
         }
         case KIND_C: {
-            jchar v = static_cast<jchar>(src.i);
-            env->SetCharArrayRegion(static_cast<jcharArray>(arr), idx, 1, &v);
+            // Type-check like KIND_S path — avoid SIGSEGV on non-[C].
+            jclass charArrCls = c.char_arr != nullptr ? c.char_arr : find_jni_class(env, "[C");
+            if (charArrCls != nullptr && env->IsInstanceOf(arr, charArrCls)) {
+                jchar v = static_cast<jchar>(src.i);
+                env->SetCharArrayRegion(static_cast<jcharArray>(arr), idx, 1, &v);
+            } else {
+                jclass shortArrCls = find_jni_class(env, "[S");
+                if (shortArrCls != nullptr && env->IsInstanceOf(arr, shortArrCls)) {
+                    jshort v = static_cast<jshort>(src.i);
+                    env->SetShortArrayRegion(static_cast<jshortArray>(arr), idx, 1, &v);
+                } else {
+                    throw_cce(env, "aput-char bad array");
+                    return false;
+                }
+            }
             return !env->ExceptionCheck();
         }
         case KIND_L:
@@ -1279,6 +1904,9 @@ static bool filled_new_array(JNIEnv* env, const std::string& type,
     }
     pending.valid = true;
     pending.o = arr;
+    pending.o_global = false;
+    pending.k = RK_L;
+    pending.i = 0;
     return true;
 }
 
@@ -1288,9 +1916,18 @@ static bool dispatch_exception(JNIEnv* env, const Pvm2Image& img, size_t fault_p
     if (ex == nullptr) {
         return false;
     }
-    // Must clear before FindClass/IsInstanceOf (JNI forbids calls with pending exception).
-    jthrowable held = static_cast<jthrowable>(env->NewLocalRef(ex));
+    // Clear FIRST — JNI forbids NewLocalRef/NewGlobalRef with a pending exception.
+    // The ExceptionOccurred local remains valid after Clear until we DeleteLocalRef it.
     env->ExceptionClear();
+
+    bool held_global = false;
+    jobject held = dup_owned_ref(env, ex, &held_global);
+    if (held_global || held != static_cast<jobject>(ex)) {
+        env->DeleteLocalRef(ex);
+    }
+    if (held == nullptr) {
+        return false;
+    }
 
     for (const auto& h : img.handlers) {
         if (fault_pc < h.start || fault_pc >= h.end) {
@@ -1308,17 +1945,199 @@ static bool dispatch_exception(JNIEnv* env, const Pvm2Image& img, size_t fault_p
         if (!match) {
             continue;
         }
-        if (*stashed_exception != nullptr) {
-            env->DeleteLocalRef(*stashed_exception);
+        release_stash(env, stashed_exception);
+        if (held_global) {
+            jobject local = global_to_local(env, held);
+            if (local == nullptr) {
+                // Rare OOM: rethrow via Global so the throwable is not dropped.
+                env->Throw(static_cast<jthrowable>(held));
+                release_ref(env, held, true);
+                return false;
+            }
+            held = local;
+            held_global = false;
         }
-        *stashed_exception = env->NewLocalRef(held);
-        env->DeleteLocalRef(held);
+        // Transfer ownership into stash — no NewLocalRef+Delete alias.
+        *stashed_exception = held;
         *pc = h.handler_pc;
         return true;
     }
-    env->Throw(held);
-    env->DeleteLocalRef(held);
+
+    if (held_global) {
+        jobject local = global_to_local(env, held);
+        if (local == nullptr) {
+            env->Throw(static_cast<jthrowable>(held));
+            release_ref(env, held, true);
+            return false;
+        }
+        held = local;
+        held_global = false;
+    }
+    if (held != nullptr) {
+        env->Throw(static_cast<jthrowable>(held));
+        // Pending exception keeps the object alive; drop our owned local.
+        release_ref(env, held, false);
+    }
     return false;
+}
+
+struct VmpLru {
+    std::mutex mu;
+    std::list<CodeItem*> order; // front = MRU
+    std::unordered_map<CodeItem*, std::list<CodeItem*>::iterator> pos;
+};
+
+static VmpLru g_vmp_lru;
+
+static int vmp_lru_cap() {
+    int n = runtime_state().config.vmp_lru;
+    if (n < 1) n = 1;
+    if (n > 256) n = 256;
+    return n;
+}
+
+static void wipe_vmp_plaintext(CodeItem* item) {
+    if (item == nullptr) return;
+    if (!item->vm_image.empty()) {
+        memset(item->vm_image.data(), 0, item->vm_image.size());
+        item->vm_image.clear();
+        item->vm_image.shrink_to_fit();
+    }
+    item->parsed_vm.reset();
+}
+
+static void lru_remove_item(CodeItem* item) {
+    if (item == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_vmp_lru.mu);
+    auto it = g_vmp_lru.pos.find(item);
+    if (it == g_vmp_lru.pos.end()) return;
+    g_vmp_lru.order.erase(it->second);
+    g_vmp_lru.pos.erase(it);
+}
+
+static void lru_touch(CodeItem* item) {
+    if (item == nullptr) return;
+    std::vector<CodeItem*> victims;
+    {
+        std::lock_guard<std::mutex> lock(g_vmp_lru.mu);
+        auto it = g_vmp_lru.pos.find(item);
+        if (it != g_vmp_lru.pos.end()) {
+            g_vmp_lru.order.erase(it->second);
+        }
+        g_vmp_lru.order.push_front(item);
+        g_vmp_lru.pos[item] = g_vmp_lru.order.begin();
+
+        const int cap = vmp_lru_cap();
+        while (static_cast<int>(g_vmp_lru.order.size()) > cap) {
+            CodeItem* victim = nullptr;
+            for (auto rit = g_vmp_lru.order.rbegin(); rit != g_vmp_lru.order.rend(); ++rit) {
+                CodeItem* cand = *rit;
+                if (cand == nullptr || cand == item) continue;
+                if (cand->vmp_in_use.load(std::memory_order_acquire) > 0) continue;
+                victim = cand;
+                break;
+            }
+            if (victim == nullptr) break;
+            auto pos_it = g_vmp_lru.pos.find(victim);
+            if (pos_it != g_vmp_lru.pos.end()) {
+                g_vmp_lru.order.erase(pos_it->second);
+                g_vmp_lru.pos.erase(pos_it);
+            }
+            victims.push_back(victim);
+        }
+    }
+    for (CodeItem* v : victims) {
+        std::lock_guard<std::mutex> plock(v->parse_mu);
+        if (v->vmp_in_use.load(std::memory_order_acquire) > 0) {
+            continue;
+        }
+        wipe_vmp_plaintext(v);
+    }
+}
+
+struct VmpUsePin {
+    CodeItem* item = nullptr;
+    void acquire(CodeItem* i) {
+        item = i;
+        item->vmp_in_use.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~VmpUsePin() {
+        if (item == nullptr) return;
+        item->vmp_in_use.fetch_sub(1, std::memory_order_acq_rel);
+        if (!runtime_state().environment_degraded.load(std::memory_order_acquire)) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> plock(item->parse_mu);
+            if (item->vmp_in_use.load(std::memory_order_acquire) != 0) {
+                return;
+            }
+            wipe_vmp_plaintext(item);
+        }
+        lru_remove_item(item);
+    }
+    VmpUsePin() = default;
+    VmpUsePin(const VmpUsePin&) = delete;
+    VmpUsePin& operator=(const VmpUsePin&) = delete;
+};
+
+/** Caller holds item->parse_mu. Ciphertext at item->insns is left intact. */
+static bool ensure_true_vmp_plaintext_locked(CodeItem* item) {
+    auto& state = runtime_state();
+    if (item->vm_image.empty()) {
+        if (state.config.insns_aes_key.size() != 16) {
+            return false;
+        }
+        if (item->insns == nullptr || item->insns_size == 0 || item->plain_insns_size == 0) {
+            return false;
+        }
+        item->vm_image.resize(item->plain_insns_size);
+        if (!crypto::aes128_gcm_decrypt(state.config.insns_aes_key.data(),
+                                        item->insns, item->insns_size,
+                                        item->vm_image.data(), item->vm_image.size())) {
+            item->vm_image.clear();
+            item->vm_image.shrink_to_fit();
+            return false;
+        }
+    }
+    if (item->parsed_vm == nullptr || !item->parsed_vm->valid) {
+        auto parsed = std::make_unique<Pvm2Image>();
+        if (!parse_pvm2(item->vm_image.data(), item->vm_image.size(), parsed.get())
+                || !parsed->valid) {
+            return false;
+        }
+        item->parsed_vm = std::move(parsed);
+    }
+    return true;
+}
+
+void clear_true_vmp_lru() {
+    std::vector<CodeItem*> wipe_list;
+    std::vector<CodeItem*> pinned;
+    {
+        std::lock_guard<std::mutex> lock(g_vmp_lru.mu);
+        for (CodeItem* item : g_vmp_lru.order) {
+            if (item == nullptr) continue;
+            if (item->vmp_in_use.load(std::memory_order_acquire) > 0) {
+                pinned.push_back(item);
+            } else {
+                wipe_list.push_back(item);
+            }
+        }
+        g_vmp_lru.order.clear();
+        g_vmp_lru.pos.clear();
+        for (CodeItem* p : pinned) {
+            g_vmp_lru.order.push_front(p);
+            g_vmp_lru.pos[p] = g_vmp_lru.order.begin();
+        }
+    }
+    for (CodeItem* v : wipe_list) {
+        std::lock_guard<std::mutex> plock(v->parse_mu);
+        if (v->vmp_in_use.load(std::memory_order_acquire) > 0) {
+            continue;
+        }
+        wipe_vmp_plaintext(v);
+    }
 }
 
 PROTECTOR_ENCRYPT bool prepare_true_vmp_images() {
@@ -1326,7 +2145,6 @@ PROTECTOR_ENCRYPT bool prepare_true_vmp_images() {
     if (state.config.insns_aes_key.size() != 16) {
         return false;
     }
-    // Bind VMP plaintext exposure to SO integrity.
     risk::so_guard_check();
     if (state.environment_degraded.load(std::memory_order_acquire)
             && state.config.rasp_action.load(std::memory_order_relaxed)
@@ -1334,6 +2152,7 @@ PROTECTOR_ENCRYPT bool prepare_true_vmp_images() {
         PLOGE("TRUE_VMP prepare refused: environment degraded");
         return false;
     }
+    int count = 0;
     for (auto& dex : state.code_map) {
         for (auto& kv : dex.second) {
             CodeItem* item = kv.second;
@@ -1344,41 +2163,35 @@ PROTECTOR_ENCRYPT bool prepare_true_vmp_images() {
                 PLOGE("TRUE_VMP missing payload method=%u", item->method_idx);
                 return false;
             }
-            item->vm_image.resize(item->plain_insns_size);
-            if (!crypto::aes128_gcm_decrypt(state.config.insns_aes_key.data(),
-                                            item->insns, item->insns_size,
-                                            item->vm_image.data(), item->vm_image.size())) {
-                PLOGE("TRUE_VMP decrypt failed method=%u", item->method_idx);
-                item->vm_image.clear();
-                return false;
-            }
-            memset(item->insns, 0, item->insns_size);
-            item->insns = nullptr;
-            item->insns_size = 0;
-            item->patched.store(true);
-            PLOGI("TRUE_VMP prepared dex=%d method=%u size=%zu",
-                  dex.first, item->method_idx, item->vm_image.size());
+            count++;
         }
     }
+    PLOGI("TRUE_VMP indexed count=%d lru=%d", count, vmp_lru_cap());
     return true;
 }
 
 PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint32_t method_idx,
                                                  jobjectArray args) {
+    if (!ensure_well_known_classes(env)) {
+        throw_runtime(env, "VMP class cache");
+        return nullptr;
+    }
+    auto& box = jni_cache();
+
     auto& state = runtime_state();
     auto dex_it = state.code_map.find(dex_index);
     if (dex_it == state.code_map.end()) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP bad dex");
+        throw_runtime(env, "VMP bad dex");
         return nullptr;
     }
     auto m_it = dex_it->second.find(method_idx);
     if (m_it == dex_it->second.end() || m_it->second == nullptr) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP bad method");
+        throw_runtime(env, "VMP bad method");
         return nullptr;
     }
     CodeItem* item = m_it->second;
     if ((item->flags & FLAG_TRUE_VMP) == 0 || item->vm_image.empty()) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP not ready");
+        throw_runtime(env, "VMP not ready");
         return nullptr;
     }
 
@@ -1388,7 +2201,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
             auto parsed = std::make_unique<Pvm2Image>();
             if (!parse_pvm2(item->vm_image.data(), item->vm_image.size(), parsed.get())
                     || !parsed->valid) {
-                env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP bad image");
+                throw_runtime(env, "VMP bad image");
                 return nullptr;
             }
             item->parsed_vm = std::move(parsed);
@@ -1397,64 +2210,74 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
     const Pvm2Image& img = *item->parsed_vm;
 
     std::vector<Reg> regs(img.reg_count);
+    // L3: reserve locals for registers + invoke scratch so the table does not recycle mid-run.
+    (void)env->EnsureLocalCapacity(static_cast<jint>(img.reg_count) + 256);
+
     const int arg_count = args ? env->GetArrayLength(args) : 0;
-    // v2+ images reserve the last register as compiler scratch for lit lowering.
-    const int scratch_reserve = (img.version >= PVM2_VERSION_V2) ? 1 : 0;
+    // v2–v4: last register is lit scratch. v5: scratch_extra (1–3) after the Dalvik frame.
+    const int scratch_reserve = static_cast<int>(img.scratch_extra);
     if (static_cast<int>(img.reg_count) < static_cast<int>(img.ins_size) + scratch_reserve) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP bad frame");
+        throw_runtime(env, "VMP bad frame");
         return nullptr;
     }
     int param_base = static_cast<int>(img.reg_count) - static_cast<int>(img.ins_size) - scratch_reserve;
     if (param_base < 0) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP bad frame");
+        throw_runtime(env, "VMP bad frame");
         return nullptr;
     }
 
-    // Cache boxed primitive classes (FindClass is relatively expensive per-arg).
-    jclass intCls = env->FindClass("java/lang/Integer");
-    jclass longCls = env->FindClass("java/lang/Long");
-    jclass boolCls = env->FindClass("java/lang/Boolean");
-    jclass floatCls = env->FindClass("java/lang/Float");
-    jclass doubleCls = env->FindClass("java/lang/Double");
-    if (intCls == nullptr || longCls == nullptr || boolCls == nullptr
-            || floatCls == nullptr || doubleCls == nullptr) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP box classes");
-        return nullptr;
-    }
+    jclass intCls = box.integer_cls;
+    jclass longCls = box.long_cls;
+    jclass boolCls = box.boolean_cls;
+    jclass floatCls = box.float_cls;
+    jclass doubleCls = box.double_cls;
+
+    PendingResult pending;
+    jobject stashed_exception = nullptr;
+    InterpFrameScope frame_scope(regs, pending, &stashed_exception);
 
     int r = param_base;
     for (int i = 0; i < arg_count; i++) {
         if (r >= static_cast<int>(img.reg_count)) {
             clear_regs(env, regs);
-            env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP args overflow");
+            throw_runtime(env, "VMP args overflow");
             return nullptr;
         }
         jobject a = env->GetObjectArrayElement(args, i);
         if (a == nullptr) {
-            regs[r].o = nullptr;
+            reg_take_o(env, &regs[r], nullptr);
             r += 1;
             continue;
         }
         if (env->IsInstanceOf(a, intCls)) {
             unbox_arg(env, a, "I", &regs[r]);
+            env->DeleteLocalRef(a);
             r += 1;
         } else if (env->IsInstanceOf(a, longCls)) {
             unbox_arg(env, a, "J", &regs[r]);
+            env->DeleteLocalRef(a);
             r += 2;
         } else if (env->IsInstanceOf(a, boolCls)) {
             unbox_arg(env, a, "Z", &regs[r]);
+            env->DeleteLocalRef(a);
             r += 1;
         } else if (env->IsInstanceOf(a, floatCls)) {
             unbox_arg(env, a, "F", &regs[r]);
+            env->DeleteLocalRef(a);
             r += 1;
         } else if (env->IsInstanceOf(a, doubleCls)) {
             unbox_arg(env, a, "D", &regs[r]);
+            env->DeleteLocalRef(a);
             r += 2;
         } else {
-            regs[r].o = env->NewLocalRef(a);
+            bool g = false;
+            jobject copy = dup_owned_ref(env, a, &g);
+            if (g || copy != a) {
+                env->DeleteLocalRef(a);
+            }
+            reg_take_o(env, &regs[r], copy, g);
             r += 1;
         }
-        env->DeleteLocalRef(a);
         if (env->ExceptionCheck()) {
             clear_regs(env, regs);
             return nullptr;
@@ -1466,9 +2289,8 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
     size_t pc = 0;
     size_t fault_pc = 0;
     jobject result = nullptr;
+    bool result_is_global = false;
     bool finished = false;
-    PendingResult pending;
-    jobject stashed_exception = nullptr;
 
     while (!finished && pc < code_size) {
         fault_pc = pc;
@@ -1480,18 +2302,20 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
             case OP_CONST: {
                 if (pc + 5 > code_size) goto fail;
                 uint8_t dst = code[pc++];
-                int32_t imm = read_i32(code + pc);
+                int32_t imm = read_i32(code + pc) ^ img.imm_key;
                 pc += 4;
                 if (!reg_bounds(dst, regs.size())) goto fail;
+                reg_as_i(env, &regs[dst]);
                 regs[dst].i = imm;
                 break;
             }
             case OP_CONST_WIDE: {
                 if (pc + 9 > code_size) goto fail;
                 uint8_t dst = code[pc++];
-                int64_t imm = read_i64(code + pc);
+                int64_t imm = read_i64(code + pc) ^ imm_key64(img.imm_key);
                 pc += 8;
                 if (!reg_bounds_wide(dst, regs.size())) goto fail;
+                reg_as_j(env, &regs[dst]);
                 regs[dst].j = imm;
                 break;
             }
@@ -1501,8 +2325,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 uint16_t idx = read_u16(code + pc);
                 pc += 2;
                 if (!reg_bounds(dst, regs.size()) || idx >= img.strings.size()) goto fail;
-                if (regs[dst].o) env->DeleteLocalRef(regs[dst].o);
-                regs[dst].o = env->NewStringUTF(img.strings[idx].c_str());
+                reg_take_o(env, &regs[dst], env->NewStringUTF(img.strings[idx].c_str()));
                 break;
             }
             case OP_MOVE: {
@@ -1510,6 +2333,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 uint8_t dst = code[pc++];
                 uint8_t src = code[pc++];
                 if (!reg_bounds(dst, regs.size()) || !reg_bounds(src, regs.size())) goto fail;
+                reg_as_i(env, &regs[dst]);
                 regs[dst].i = regs[src].i;
                 break;
             }
@@ -1518,6 +2342,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 uint8_t dst = code[pc++];
                 uint8_t src = code[pc++];
                 if (!reg_bounds_wide(dst, regs.size()) || !reg_bounds_wide(src, regs.size())) goto fail;
+                reg_as_j(env, &regs[dst]);
                 regs[dst].j = regs[src].j;
                 break;
             }
@@ -1526,8 +2351,12 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 uint8_t dst = code[pc++];
                 uint8_t src = code[pc++];
                 if (!reg_bounds(dst, regs.size()) || !reg_bounds(src, regs.size())) goto fail;
-                if (regs[dst].o) env->DeleteLocalRef(regs[dst].o);
-                regs[dst].o = regs[src].o ? env->NewLocalRef(regs[src].o) : nullptr;
+                if (dst == src) {
+                    break;  // move-object vX, vX is a no-op
+                }
+                bool g = false;
+                jobject copy = regs[src].o ? dup_owned_ref(env, regs[src].o, &g) : nullptr;
+                reg_take_o(env, &regs[dst], copy, g);
                 break;
             }
             case OP_GOTO: {
@@ -1545,7 +2374,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 int16_t rel = read_i16(code + pc);
                 pc += 2;
                 if (!reg_bounds(a, regs.size()) || !reg_bounds(b, regs.size())) goto fail;
-                if (cmp_i32(cond, regs[a].i, regs[b].i)) {
+                if (eval_if_cmp(env, cond, regs[a], regs[b])) {
                     pc = static_cast<size_t>(static_cast<ptrdiff_t>(pc) + rel);
                 }
                 break;
@@ -1557,7 +2386,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 int16_t rel = read_i16(code + pc);
                 pc += 2;
                 if (!reg_bounds(a, regs.size())) goto fail;
-                if (cmp_i32(cond, regs[a].i, 0)) {
+                if (eval_if_z(cond, regs[a])) {
                     pc = static_cast<size_t>(static_cast<ptrdiff_t>(pc) + rel);
                 }
                 break;
@@ -1600,7 +2429,14 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (pc + 1 > code_size) goto fail;
                 uint8_t src = code[pc++];
                 if (!reg_bounds(src, regs.size())) goto fail;
-                result = regs[src].o ? env->NewLocalRef(regs[src].o) : nullptr;
+                // Survive clear_regs: never share a Local cookie with a register.
+                if (regs[src].o != nullptr) {
+                    result = env->NewGlobalRef(regs[src].o);
+                    result_is_global = true;
+                } else {
+                    result = nullptr;
+                    result_is_global = false;
+                }
                 finished = true;
                 break;
             }
@@ -1621,10 +2457,12 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     }
                     clear_pending(env, pending);
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 regs[dst].i = out;
+                regs[dst].k = RK_I;
+                reg_drop_obj(env, &regs[dst]);
                 break;
             }
             case OP_BINOP_2ADDR: {
@@ -1640,10 +2478,12 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     }
                     clear_pending(env, pending);
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 regs[dst].i = out;
+                regs[dst].k = RK_I;
+                reg_drop_obj(env, &regs[dst]);
                 break;
             }
             case OP_BINOP_WIDE: {
@@ -1668,10 +2508,12 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     }
                     clear_pending(env, pending);
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 regs[dst].j = out;
+                regs[dst].k = RK_J;
+                reg_drop_obj(env, &regs[dst]);
                 break;
             }
             case OP_BINOP_2ADDR_WIDE: {
@@ -1694,10 +2536,12 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     }
                     clear_pending(env, pending);
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 regs[dst].j = out;
+                regs[dst].k = RK_J;
+                reg_drop_obj(env, &regs[dst]);
                 break;
             }
             case OP_BINOP_FLOAT: {
@@ -1710,6 +2554,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     !reg_bounds(c, regs.size())) {
                     goto fail;
                 }
+                reg_as_i(env, &regs[dst]);
                 regs[dst].i = float_bits(binop_f32(bin, as_float(regs[b].i), as_float(regs[c].i)));
                 break;
             }
@@ -1719,8 +2564,10 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 uint8_t dst = code[pc++];
                 uint8_t src = code[pc++];
                 if (!reg_bounds(dst, regs.size()) || !reg_bounds(src, regs.size())) goto fail;
-                regs[dst].i = float_bits(
+                int32_t bits = float_bits(
                         binop_f32(bin, as_float(regs[dst].i), as_float(regs[src].i)));
+                reg_as_i(env, &regs[dst]);
+                regs[dst].i = bits;
                 break;
             }
             case OP_BINOP_DOUBLE: {
@@ -1733,6 +2580,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     !reg_bounds_wide(c, regs.size())) {
                     goto fail;
                 }
+                reg_as_j(env, &regs[dst]);
                 regs[dst].j = double_bits(
                         binop_f64(bin, as_double(regs[b].j), as_double(regs[c].j)));
                 break;
@@ -1745,8 +2593,10 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (!reg_bounds_wide(dst, regs.size()) || !reg_bounds_wide(src, regs.size())) {
                     goto fail;
                 }
-                regs[dst].j = double_bits(
+                int64_t bits = double_bits(
                         binop_f64(bin, as_double(regs[dst].j), as_double(regs[src].j)));
+                reg_as_j(env, &regs[dst]);
+                regs[dst].j = bits;
                 break;
             }
             case OP_UNOP: {
@@ -1770,7 +2620,13 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (wide_src ? !reg_bounds_wide(src, regs.size()) : !reg_bounds(src, regs.size())) {
                     goto fail;
                 }
-                if (!apply_unop(kind, &regs[dst], regs[src])) goto fail;
+                Reg src_copy = regs[src];
+                if (wide_dst) {
+                    reg_as_j(env, &regs[dst]);
+                } else {
+                    reg_as_i(env, &regs[dst]);
+                }
+                if (!apply_unop(kind, &regs[dst], src_copy)) goto fail;
                 break;
             }
             case OP_CMP: {
@@ -1784,6 +2640,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     case CMP_FLOAT_L:
                     case CMP_FLOAT_G:
                         if (!reg_bounds(b, regs.size()) || !reg_bounds(c, regs.size())) goto fail;
+                        reg_as_i(env, &regs[dst]);
                         regs[dst].i = cmp_float(as_float(regs[b].i), as_float(regs[c].i),
                                                 kind == CMP_FLOAT_G);
                         break;
@@ -1792,6 +2649,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                         if (!reg_bounds_wide(b, regs.size()) || !reg_bounds_wide(c, regs.size())) {
                             goto fail;
                         }
+                        reg_as_i(env, &regs[dst]);
                         regs[dst].i = cmp_double(as_double(regs[b].j), as_double(regs[c].j),
                                                  kind == CMP_DOUBLE_G);
                         break;
@@ -1799,6 +2657,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                         if (!reg_bounds_wide(b, regs.size()) || !reg_bounds_wide(c, regs.size())) {
                             goto fail;
                         }
+                        reg_as_i(env, &regs[dst]);
                         regs[dst].i = cmp_long(regs[b].j, regs[c].j);
                         break;
                     default:
@@ -1810,14 +2669,13 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (pc + 1 > code_size) goto fail;
                 uint8_t obj = code[pc++];
                 if (!reg_bounds(obj, regs.size()) || regs[obj].o == nullptr) {
-                    env->ThrowNew(env->FindClass("java/lang/NullPointerException"),
-                                  "monitor-enter on null");
+                    throw_npe(env, "monitor-enter on null");
                     if (dispatch_exception(env, img, fault_pc, &pc, &stashed_exception)) {
                         break;
                     }
                     clear_pending(env, pending);
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 if (env->MonitorEnter(regs[obj].o) != 0) {
@@ -1826,7 +2684,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     }
                     clear_pending(env, pending);
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 break;
@@ -1835,14 +2693,13 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (pc + 1 > code_size) goto fail;
                 uint8_t obj = code[pc++];
                 if (!reg_bounds(obj, regs.size()) || regs[obj].o == nullptr) {
-                    env->ThrowNew(env->FindClass("java/lang/NullPointerException"),
-                                  "monitor-exit on null");
+                    throw_npe(env, "monitor-exit on null");
                     if (dispatch_exception(env, img, fault_pc, &pc, &stashed_exception)) {
                         break;
                     }
                     clear_pending(env, pending);
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 if (env->MonitorExit(regs[obj].o) != 0) {
@@ -1851,7 +2708,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     }
                     clear_pending(env, pending);
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 break;
@@ -1876,7 +2733,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                         }
                         clear_pending(env, pending);
                         clear_regs(env, regs);
-                        if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                        release_stash(env, &stashed_exception);
                         return nullptr;
                     }
                     goto fail;
@@ -1887,6 +2744,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (pc + 1 > code_size) goto fail;
                 uint8_t dst = code[pc++];
                 if (!reg_bounds(dst, regs.size()) || !pending.valid) goto fail;
+                reg_as_i(env, &regs[dst]);
                 regs[dst].i = pending.i;
                 clear_pending(env, pending);
                 break;
@@ -1895,6 +2753,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (pc + 1 > code_size) goto fail;
                 uint8_t dst = code[pc++];
                 if (!reg_bounds_wide(dst, regs.size()) || !pending.valid) goto fail;
+                reg_as_j(env, &regs[dst]);
                 regs[dst].j = pending.j;
                 clear_pending(env, pending);
                 break;
@@ -1903,11 +2762,14 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (pc + 1 > code_size) goto fail;
                 uint8_t dst = code[pc++];
                 if (!reg_bounds(dst, regs.size()) || !pending.valid) goto fail;
-                if (regs[dst].o) env->DeleteLocalRef(regs[dst].o);
                 // Transfer ownership of pending local ref — do not NewLocalRef+leak.
-                regs[dst].o = pending.o;
+                jobject got = pending.o;
+                bool g = pending.o_global;
                 pending.o = nullptr;
+                pending.o_global = false;
                 pending.valid = false;
+                pending.k = RK_I;
+                reg_take_o(env, &regs[dst], got, g);
                 break;
             }
             case OP_SGET: {
@@ -1923,7 +2785,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                             break;
                         }
                         clear_regs(env, regs);
-                        if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                        release_stash(env, &stashed_exception);
                         return nullptr;
                     }
                     goto fail;
@@ -1943,7 +2805,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                             break;
                         }
                         clear_regs(env, regs);
-                        if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                        release_stash(env, &stashed_exception);
                         return nullptr;
                     }
                     goto fail;
@@ -1967,7 +2829,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                             break;
                         }
                         clear_regs(env, regs);
-                        if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                        release_stash(env, &stashed_exception);
                         return nullptr;
                     }
                     goto fail;
@@ -1991,7 +2853,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                             break;
                         }
                         clear_regs(env, regs);
-                        if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                        release_stash(env, &stashed_exception);
                         return nullptr;
                     }
                     goto fail;
@@ -2006,14 +2868,13 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (!reg_bounds(dst, regs.size()) || tid >= img.types.size()) goto fail;
                 jclass cls = find_class_desc(env, img.types[tid]);
                 if (cls == nullptr) goto fail;
-                if (regs[dst].o) env->DeleteLocalRef(regs[dst].o);
-                regs[dst].o = env->AllocObject(cls);
+                reg_take_o(env, &regs[dst], env->AllocObject(cls));
                 if (env->ExceptionCheck()) {
                     if (dispatch_exception(env, img, fault_pc, &pc, &stashed_exception)) {
                         break;
                     }
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 break;
@@ -2029,14 +2890,13 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     goto fail;
                 }
                 jsize len = regs[size_reg].i;
-                if (regs[dst].o) env->DeleteLocalRef(regs[dst].o);
-                regs[dst].o = new_array_for_type(env, img.types[tid], len);
+                reg_take_o(env, &regs[dst], new_array_for_type(env, img.types[tid], len));
                 if (env->ExceptionCheck()) {
                     if (dispatch_exception(env, img, fault_pc, &pc, &stashed_exception)) {
                         break;
                     }
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
                 break;
@@ -2057,7 +2917,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                         }
                         clear_pending(env, pending);
                         clear_regs(env, regs);
-                        if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                        release_stash(env, &stashed_exception);
                         return nullptr;
                     }
                     goto fail;
@@ -2069,15 +2929,26 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 uint8_t dst = code[pc++];
                 uint8_t arr = code[pc++];
                 if (!reg_bounds(dst, regs.size()) || !reg_bounds(arr, regs.size())) goto fail;
-                regs[dst].i = env->GetArrayLength(static_cast<jarray>(regs[arr].o));
+                if (regs[arr].o == nullptr) {
+                    throw_npe(env, "array-length on null");
+                    if (dispatch_exception(env, img, fault_pc, &pc, &stashed_exception)) {
+                        break;
+                    }
+                    clear_regs(env, regs);
+                    release_stash(env, &stashed_exception);
+                    return nullptr;
+                }
+                int32_t len = env->GetArrayLength(static_cast<jarray>(regs[arr].o));
                 if (env->ExceptionCheck()) {
                     if (dispatch_exception(env, img, fault_pc, &pc, &stashed_exception)) {
                         break;
                     }
                     clear_regs(env, regs);
-                    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                    release_stash(env, &stashed_exception);
                     return nullptr;
                 }
+                reg_as_i(env, &regs[dst]);
+                regs[dst].i = len;
                 break;
             }
             case OP_AGET: {
@@ -2096,7 +2967,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                             break;
                         }
                         clear_regs(env, regs);
-                        if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                        release_stash(env, &stashed_exception);
                         return nullptr;
                     }
                     goto fail;
@@ -2119,7 +2990,7 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                             break;
                         }
                         clear_regs(env, regs);
-                        if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                        release_stash(env, &stashed_exception);
                         return nullptr;
                     }
                     goto fail;
@@ -2136,13 +3007,12 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     jclass cls = find_class_desc(env, img.types[tid]);
                     if (cls == nullptr) goto fail;
                     if (!env->IsInstanceOf(regs[obj].o, cls)) {
-                        env->ThrowNew(env->FindClass("java/lang/ClassCastException"),
-                                      "PVM2 check-cast");
+                        throw_cce(env, "PVM2 check-cast");
                         if (dispatch_exception(env, img, fault_pc, &pc, &stashed_exception)) {
                             break;
                         }
                         clear_regs(env, regs);
-                        if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                        release_stash(env, &stashed_exception);
                         return nullptr;
                     }
                 }
@@ -2158,13 +3028,15 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     tid >= img.types.size()) {
                     goto fail;
                 }
-                if (regs[obj].o == nullptr) {
-                    regs[dst].i = 0;
-                } else {
+                // Compute before reg_as_i — dst may alias obj (instance-of v0, v0, T).
+                int32_t is_inst = 0;
+                if (regs[obj].o != nullptr) {
                     jclass cls = find_class_desc(env, img.types[tid]);
                     if (cls == nullptr) goto fail;
-                    regs[dst].i = env->IsInstanceOf(regs[obj].o, cls) ? 1 : 0;
+                    is_inst = env->IsInstanceOf(regs[obj].o, cls) ? 1 : 0;
                 }
+                reg_as_i(env, &regs[dst]);
+                regs[dst].i = is_inst;
                 break;
             }
             case OP_THROW: {
@@ -2176,17 +3048,17 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                     break;
                 }
                 clear_regs(env, regs);
-                if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+                release_stash(env, &stashed_exception);
                 return nullptr;
             }
             case OP_MOVE_EXCEPTION: {
                 if (pc + 1 > code_size) goto fail;
                 uint8_t dst = code[pc++];
                 if (!reg_bounds(dst, regs.size()) || stashed_exception == nullptr) goto fail;
-                if (regs[dst].o) env->DeleteLocalRef(regs[dst].o);
-                regs[dst].o = env->NewLocalRef(stashed_exception);
-                env->DeleteLocalRef(stashed_exception);
+                // Transfer stash ownership — avoid NewLocalRef+Delete alias on OEM ART.
+                jobject held = stashed_exception;
                 stashed_exception = nullptr;
+                reg_take_o(env, &regs[dst], held, false);
                 break;
             }
             case OP_CONST_CLASS: {
@@ -2197,8 +3069,9 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 if (!reg_bounds(dst, regs.size()) || tid >= img.types.size()) goto fail;
                 jclass cls = find_class_desc(env, img.types[tid]);
                 if (cls == nullptr) goto fail;
-                if (regs[dst].o) env->DeleteLocalRef(regs[dst].o);
-                regs[dst].o = env->NewLocalRef(cls);
+                bool g = false;
+                jobject copy = dup_owned_ref(env, cls, &g);
+                reg_take_o(env, &regs[dst], copy, g);
                 break;
             }
             case OP_NEG: {
@@ -2206,7 +3079,9 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
                 uint8_t dst = code[pc++];
                 uint8_t src = code[pc++];
                 if (!reg_bounds(dst, regs.size()) || !reg_bounds(src, regs.size())) goto fail;
-                regs[dst].i = -regs[src].i;
+                int32_t v = -regs[src].i;
+                reg_as_i(env, &regs[dst]);
+                regs[dst].i = v;
                 break;
             }
             default:
@@ -2217,19 +3092,31 @@ PROTECTOR_ENCRYPT static jobject interpret_body(JNIEnv* env, int dex_index, uint
 
     clear_pending(env, pending);
     clear_regs(env, regs);
-    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+    release_stash(env, &stashed_exception);
     if (!finished) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP fell off end");
+        if (result_is_global && result != nullptr) {
+            env->DeleteGlobalRef(result);
+        }
+        throw_runtime(env, "VMP fell off end");
         return nullptr;
+    }
+    if (result_is_global && result != nullptr) {
+        jobject local = env->NewLocalRef(result);
+        env->DeleteGlobalRef(result);
+        return local;
     }
     return result;
 
 fail:
     clear_pending(env, pending);
     clear_regs(env, regs);
-    if (stashed_exception) env->DeleteLocalRef(stashed_exception);
+    release_stash(env, &stashed_exception);
+    if (result_is_global && result != nullptr) {
+        env->DeleteGlobalRef(result);
+        result = nullptr;
+    }
     if (!env->ExceptionCheck()) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP interpret error");
+        throw_runtime(env, "VMP interpret error");
     }
     return nullptr;
 }
@@ -2264,21 +3151,34 @@ static uint8_t peek_isa_id(const std::vector<uint8_t>& image) {
 PROTECTOR_ENCRYPT jobject interpret(JNIEnv* env, int dex_index, uint32_t method_idx,
                                     jobjectArray args) {
     if (!risk::vmp_allowed()) {
-        env->ThrowNew(env->FindClass("java/lang/SecurityException"), "VMP refused by RASP");
+        clear_true_vmp_lru();
+        throw_security(env, "VMP refused by RASP");
         return nullptr;
     }
     auto& state = runtime_state();
     auto dex_it = state.code_map.find(dex_index);
     if (dex_it == state.code_map.end()) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP bad dex");
+        throw_runtime(env, "VMP bad dex");
         return nullptr;
     }
     auto m_it = dex_it->second.find(method_idx);
-    if (m_it == dex_it->second.end() || m_it->second == nullptr || m_it->second->vm_image.empty()) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "VMP bad method");
+    if (m_it == dex_it->second.end() || m_it->second == nullptr
+            || (m_it->second->flags & FLAG_TRUE_VMP) == 0) {
+        throw_runtime(env, "VMP bad method");
         return nullptr;
     }
-    uint8_t isa = peek_isa_id(m_it->second->vm_image);
+    CodeItem* item = m_it->second;
+    VmpUsePin pin;
+    {
+        std::lock_guard<std::mutex> lock(item->parse_mu);
+        if (!ensure_true_vmp_plaintext_locked(item)) {
+            throw_runtime(env, "VMP not ready");
+            return nullptr;
+        }
+        pin.acquire(item);
+    }
+    lru_touch(item);
+    uint8_t isa = peek_isa_id(item->vm_image);
     switch (isa % PVM2_ISA_COUNT) {
         case 1:
             return pvm2_run_b(env, dex_index, method_idx, args);

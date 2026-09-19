@@ -12,7 +12,7 @@ constexpr int FLAG_DISABLE_ANTI_DEBUG = 1 << 2;
 constexpr int FLAG_DISABLE_XPOSED_DETECT = 1 << 3;
 constexpr int FLAG_DISABLE_ROOT_DETECT = 1 << 4;
 constexpr int FLAG_DISABLE_EMULATOR_DETECT = 1 << 5;
-/** Disable libprotector .bitcode CRC / anti-dump map checks (so_guard). */
+/** Disable libprotector .bitcode HMAC / anti-dump map checks (so_guard). */
 constexpr int FLAG_DISABLE_SO_INTEGRITY = 1 << 6;
 
 /**
@@ -63,6 +63,9 @@ enum class CrashKind {
  */
 void handle_risk(const char* reason, CrashKind kind);
 
+/** Set degraded and drop TRUE_VMP plaintext LRU. */
+void mark_environment_degraded();
+
 // ── Diverse crash paths ─────────────────────────────────────────────
 
 /** Illegal instruction (__builtin_trap / udf#0).  Used for hook/CRC. */
@@ -83,9 +86,15 @@ void crash_exit();
 void schedule_delayed_crash();
 void check_delayed_crash();
 
+/** Delayed {@link crash_exit} for integrity failures (ignores rasp Alert/Degrade). */
+void schedule_integrity_exit();
+
 [[deprecated("Use a specific crash_* variant")]]
 void crash_on_risk();
 
 void record_java_heartbeat();
+
+/** After {@code init_app}: first legal ping required, then 15 s keepalive. */
+void arm_java_heartbeat();
 
 } // namespace protector::risk

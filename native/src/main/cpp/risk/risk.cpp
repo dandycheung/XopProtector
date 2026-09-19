@@ -7,6 +7,7 @@
 #include "common/obfuscate.h"
 #include "common/runtime_state.h"
 #include "common/protector_macro.h"
+#include "vm/pvm2_interp.h"
 
 #include <atomic>
 #include <cerrno>
@@ -36,9 +37,16 @@ namespace protector::risk {
 
 static std::atomic_bool g_started{false};
 static std::atomic_int g_delayed_crash{0};
+static std::atomic_int g_delayed_integrity_exit{0};
 static std::atomic_int64_t g_last_heartbeat_ms{0};
+static std::atomic_int64_t g_heartbeat_armed_ms{0};
 // Set immediately before crash_* so logcat shows which detector fired.
 static const char* g_crash_reason = "unknown";
+
+void mark_environment_degraded() {
+    runtime_state().environment_degraded.store(true, std::memory_order_release);
+    protector::vm::clear_true_vmp_lru();
+}
 
 PROTECTOR_ENCRYPT void handle_risk(const char* reason, CrashKind kind) {
 #if PROTECTOR_SRC_OBF
@@ -66,7 +74,7 @@ PROTECTOR_ENCRYPT void handle_risk(const char* reason, CrashKind kind) {
     PROTECTOR_CFF_CASE(2) {
         if (action == static_cast<int>(protector::RaspAction::Degrade)) {
             PLOGE("rasp degrade: %s", r);
-            runtime_state().environment_degraded.store(true, std::memory_order_release);
+            mark_environment_degraded();
             PROTECTOR_CFF_FINISH(st);
         } else {
             PROTECTOR_CFF_GOTO(st, 3);
@@ -107,7 +115,7 @@ PROTECTOR_ENCRYPT void handle_risk(const char* reason, CrashKind kind) {
     }
     if (action == static_cast<int>(protector::RaspAction::Degrade)) {
         PLOGE("rasp degrade: %s", r);
-        runtime_state().environment_degraded.store(true, std::memory_order_release);
+        mark_environment_degraded();
         return;
     }
     const char* kind_s = "block";
@@ -200,7 +208,16 @@ PROTECTOR_ENCRYPT void schedule_delayed_crash() {
     g_delayed_crash.store(1, std::memory_order_release);
 }
 
+void schedule_integrity_exit() {
+    g_delayed_integrity_exit.store(1, std::memory_order_release);
+}
+
 PROTECTOR_ENCRYPT void check_delayed_crash() {
+    if (g_delayed_integrity_exit.load(std::memory_order_acquire)) {
+        PLOGE("integrity: delayed crash_exit");
+        crash_exit();
+        return;
+    }
     if (!g_delayed_crash.load(std::memory_order_acquire)) return;
     // Honour Alert: never crash from a previously scheduled delay either.
     int action = runtime_state().config.rasp_action.load(std::memory_order_relaxed);
@@ -211,7 +228,7 @@ PROTECTOR_ENCRYPT void check_delayed_crash() {
     }
     if (action == static_cast<int>(protector::RaspAction::Degrade)) {
         g_delayed_crash.store(0, std::memory_order_release);
-        runtime_state().environment_degraded.store(true, std::memory_order_release);
+        mark_environment_degraded();
         PLOGE("rasp degrade: delayed crash → degraded flag");
         return;
     }
@@ -227,12 +244,37 @@ void record_java_heartbeat() {
     g_last_heartbeat_ms.store(now_ms(), std::memory_order_release);
 }
 
+void arm_java_heartbeat() {
+    int64_t now = now_ms();
+    int64_t expected = 0;
+    g_heartbeat_armed_ms.compare_exchange_strong(expected, now, std::memory_order_acq_rel);
+}
+
+/** After the first valid ping, Java must keep pinging. */
+static constexpr int64_t kHeartbeatKeepaliveMs = 15000;
+/**
+ * init_app arms before DexMerger / SO decrypt (ACF FileBootstrap especially).
+ * That work can exceed 15 s on a cold protect-so launch; 15 s still applies
+ * after the first legal ping.
+ */
+static constexpr int64_t kHeartbeatFirstPingMs = 90000;
+
 /** Check if Java-layer heartbeat is still arriving. */
 static void check_heartbeat() {
+    int64_t armed = g_heartbeat_armed_ms.load(std::memory_order_acquire);
+    if (armed == 0) return;  // init_app not reached (no protect assets)
     int64_t last = g_last_heartbeat_ms.load(std::memory_order_acquire);
-    if (last == 0) return;  // not yet initialised
-    int64_t elapsed = now_ms() - last;
-    if (elapsed > 15000) {  // 15 s timeout
+    int64_t now = now_ms();
+    if (last == 0) {
+        int64_t elapsed = now - armed;
+        if (elapsed > kHeartbeatFirstPingMs) {
+            PLOGE("Java heartbeat never arrived (%lld ms after init_app)", (long long)elapsed);
+            handle_risk("java_heartbeat", CrashKind::Abort);
+        }
+        return;
+    }
+    int64_t elapsed = now - last;
+    if (elapsed > kHeartbeatKeepaliveMs) {
         PLOGE("Java heartbeat lost (%lld ms)", (long long)elapsed);
         handle_risk("java_heartbeat", CrashKind::Abort);
     }
@@ -540,10 +582,14 @@ void scan_hooks_and_frida_now() {
 
 bool vmp_allowed() {
     auto& state = runtime_state();
+    if (so_guard_integrity_failed()) {
+        return false;
+    }
     if (state.environment_degraded.load(std::memory_order_acquire)) {
         return false;
     }
-    // Periodic light SO pulse (every 64th TRUE_VMP call) without scanning Frida every time.
+    // Periodic SO pulse (every 64th TRUE_VMP call): HMAC + maps live here, not
+    // on every interpret (full .bitcode HMAC is too expensive for the UI thread).
     static std::atomic<uint32_t> tick{0};
     uint32_t n = tick.fetch_add(1, std::memory_order_relaxed);
     if ((n & 63u) == 0u) {
@@ -551,7 +597,8 @@ bool vmp_allowed() {
         if ((flags & FLAG_DISABLE_SO_INTEGRITY) == 0) {
             so_guard_check();
         }
-        if (state.environment_degraded.load(std::memory_order_acquire)) {
+        if (so_guard_integrity_failed()
+                || state.environment_degraded.load(std::memory_order_acquire)) {
             return false;
         }
     }

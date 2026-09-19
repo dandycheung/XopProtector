@@ -12,7 +12,13 @@ namespace protector::vm {
  */
 jobject interpret(JNIEnv* env, int dex_index, uint32_t method_idx, jobjectArray args);
 
-/** Decrypt all FLAG_TRUE_VMP payloads into CodeItem::vm_image after code.bin parse. */
+/**
+ * Startup no-op besides indexing checks. TRUE_VMP GCM decrypt happens on first
+ * {@link interpret} (LRU plaintext window).
+ */
 bool prepare_true_vmp_images();
+
+/** Wipe decrypted TRUE_VMP images (environment_degraded / re-init). */
+void clear_true_vmp_lru();
 
 } // namespace protector::vm

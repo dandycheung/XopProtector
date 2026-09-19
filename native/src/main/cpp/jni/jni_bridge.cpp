@@ -15,11 +15,29 @@
 
 #define JNI_BRIDGE "com/yqsh/protector/shell/JniBridge"
 #define JNI_VMBRIDGE "com/yqsh/protector/shell/VmBridge"
+#define JNI_PROXY_APP "com/yqsh/protector/shell/ProxyApplication"
+
+static jclass g_jni_bridge_class = nullptr;
+static jclass g_proxy_app_class = nullptr;
+
+static bool shell_heartbeat_ok(JNIEnv* env, jclass clazz, jobject shell) {
+    if (env == nullptr || clazz == nullptr || shell == nullptr) return false;
+    if (g_jni_bridge_class == nullptr || g_proxy_app_class == nullptr) return false;
+    if (!env->IsSameObject(clazz, g_jni_bridge_class)) return false;
+    if (!env->IsInstanceOf(shell, g_proxy_app_class)) return false;
+    return true;
+}
 
 /** Java→Native heartbeat: records a ping so the risk thread knows the
- *  Java shell is still intact. */
-static void native_heartbeat(JNIEnv*, jclass) {
+ *  Java shell is still intact. Caller must be JniBridge + a live ProxyApplication. */
+static void native_heartbeat(JNIEnv* env, jclass clazz, jobject shell) {
+    if (!shell_heartbeat_ok(env, clazz, shell)) {
+        PLOGE("java shell heartbeat rejected");
+        protector::risk::handle_risk("java_shell", protector::risk::CrashKind::Abort);
+        return;
+    }
     protector::risk::record_java_heartbeat();
+    protector::runtime::maybe_verify_junk_class();
 }
 
 static jobject native_interpret(JNIEnv* env, jclass, jint dexIndex, jint methodIdx,
@@ -69,7 +87,7 @@ static void native_report_threat(JNIEnv* env, jclass, jstring reason) {
     int action = protector::runtime_state().config.rasp_action.load(std::memory_order_relaxed);
     protector::report::report_threat(reason_str.c_str(), action);
     if (action != static_cast<int>(protector::RaspAction::Alert)) {
-        protector::runtime_state().environment_degraded.store(true, std::memory_order_release);
+        protector::risk::mark_environment_degraded();
     }
 }
 
@@ -82,7 +100,8 @@ static void native_prepatch_extracted(JNIEnv* env, jclass, jstring dir) {
 }
 
 static JNINativeMethod g_methods[] = {
-        {"initApp", "(Ljava/lang/String;)V", (void*)protector::runtime::init_app},
+        {"initApp", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+         (void*)protector::runtime::init_app},
         {"setNativeLibraryDir", "(Ljava/lang/String;)V", (void*)native_set_native_lib_dir},
         {"enableJunkVerify", "()V", (void*)protector::runtime::enable_junk_verify},
         {"prepatchExtractedDexes", "(Ljava/lang/String;)V", (void*)native_prepatch_extracted},
@@ -92,7 +111,7 @@ static JNINativeMethod g_methods[] = {
          (void*)protector::runtime::native_version},
         {"verifySignature", "(Landroid/content/Context;)V",
          (void*)protector::runtime::verify_signature},
-        {"heartbeat", "()V", (void*)native_heartbeat},
+        {"heartbeat", "(Landroid/app/Application;)V", (void*)native_heartbeat},
         {"isEnvironmentDegraded", "()Z",
          (void*)protector::runtime::environment_degraded},
         {"drainThreatReports", "()Ljava/lang/String;",
@@ -129,6 +148,25 @@ PROTECTOR_ENCRYPT JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         PLOGE("RegisterNatives JniBridge failed");
         return JNI_ERR;
     }
+    g_jni_bridge_class = reinterpret_cast<jclass>(env->NewGlobalRef(clazz));
+    env->DeleteLocalRef(clazz);
+    if (g_jni_bridge_class == nullptr) {
+        PLOGE("JniBridge NewGlobalRef failed");
+        return JNI_ERR;
+    }
+
+    jclass proxyCls = env->FindClass(JNI_PROXY_APP);
+    if (!proxyCls) {
+        PLOGE("cannot find ProxyApplication");
+        return JNI_ERR;
+    }
+    g_proxy_app_class = reinterpret_cast<jclass>(env->NewGlobalRef(proxyCls));
+    env->DeleteLocalRef(proxyCls);
+    if (g_proxy_app_class == nullptr) {
+        PLOGE("ProxyApplication NewGlobalRef failed");
+        return JNI_ERR;
+    }
+
     jclass vmCls = env->FindClass(JNI_VMBRIDGE);
     if (!vmCls) {
         PLOGE("cannot find VmBridge");

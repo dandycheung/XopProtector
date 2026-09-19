@@ -16,6 +16,7 @@ constexpr uint16_t PVM2_VERSION_V1 = 1;
 constexpr uint16_t PVM2_VERSION_V2 = 2;
 constexpr uint16_t PVM2_VERSION_V3 = 3;
 constexpr uint16_t PVM2_VERSION_V4 = 4;
+constexpr uint16_t PVM2_VERSION_V5 = 5;
 
 /** Morph table size for v3 images. */
 constexpr uint8_t PVM2_OP_COUNT_V3 = 40;
@@ -172,6 +173,10 @@ struct Pvm2Image {
     /** inverse[wire] = canonical; identity for v1/v2. */
     std::array<uint8_t, 256> inv_map{};
     bool has_morph = false;
+    /** v5+: XOR key for CONST / CONST_WIDE immediates. v1–v4 = 0. */
+    int32_t imm_key = 0;
+    /** Extra compiler scratch regs after the Dalvik frame. v2–v4 = 1; v1 = 0. */
+    uint8_t scratch_extra = 1;
     std::vector<std::string> strings;
     std::vector<std::string> methods;
     std::vector<std::string> fields;

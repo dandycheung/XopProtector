@@ -15,13 +15,16 @@ public final class Pvm2Morph {
 
     /** Profile id written into PVM2 v3 header (0..2). */
     public final int isaId;
+    /** Per-build XOR for CONST / CONST_WIDE immediates (v5). */
+    public final int immKey;
     /** forward[canonical] = wire */
     public final byte[] forward;
     /** inverse[wire & 0xff] = canonical, or -1 if unused */
     public final int[] inverse;
 
-    private Pvm2Morph(int isaId, byte[] forward, int[] inverse) {
+    private Pvm2Morph(int isaId, int immKey, byte[] forward, int[] inverse) {
         this.isaId = isaId;
+        this.immKey = immKey;
         this.forward = forward;
         this.inverse = inverse;
     }
@@ -63,7 +66,11 @@ public final class Pvm2Morph {
             forward[canonical] = (byte) wire;
             inverse[wire] = canonical;
         }
-        return new Pvm2Morph(isaId, forward, inverse);
+        int immKey = rng.nextInt();
+        if (immKey == 0) {
+            immKey = 0xA5A5A5A5;
+        }
+        return new Pvm2Morph(isaId, immKey, forward, inverse);
     }
 
     /** Instruction length in bytes for a canonical opcode at {@code code[pc]}. */
@@ -139,14 +146,35 @@ public final class Pvm2Morph {
         }
     }
 
-    /** Rewrite first byte of each insn from canonical → wire (in place). */
+    /** Rewrite opcode bytes canonical → wire and XOR CONST immediates (in place). */
     public void morphCodeInPlace(byte[] code) {
         int pc = 0;
         while (pc < code.length) {
             int canon = code[pc] & 0xff;
             int size = insnSize(code, pc);
+            if (canon == Pvm2Opcodes.OP_CONST) {
+                xorI32Le(code, pc + 2, immKey);
+            } else if (canon == Pvm2Opcodes.OP_CONST_WIDE) {
+                xorI32Le(code, pc + 2, immKey);
+                xorI32Le(code, pc + 6, immKey);
+            }
             code[pc] = wire(canon);
             pc += size;
         }
+    }
+
+    static void xorI32Le(byte[] code, int off, int key) {
+        if (off < 0 || off + 4 > code.length) {
+            throw new IllegalArgumentException("imm xor truncated at " + off);
+        }
+        int v = (code[off] & 0xff)
+                | ((code[off + 1] & 0xff) << 8)
+                | ((code[off + 2] & 0xff) << 16)
+                | ((code[off + 3] & 0xff) << 24);
+        v ^= key;
+        code[off] = (byte) v;
+        code[off + 1] = (byte) (v >> 8);
+        code[off + 2] = (byte) (v >> 16);
+        code[off + 3] = (byte) (v >> 24);
     }
 }

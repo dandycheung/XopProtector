@@ -670,11 +670,13 @@ public partial class HardenPage : UserControl
             IndustryAutoVmp = IndustryAutoVmpBox.IsChecked == true,
             ProtectSoBudgetMb = soBudget.BudgetMb,
             ProtectSoMaxFileMb = soBudget.MaxFileMb,
-            // Temporarily forced off: assets encrypt / res-protect / NetGuard (UI panel collapsed).
+            // Extra protect forced off (ExtraProtectPanel collapsed). Use packer CLI instead:
+            // --encrypt-assets (app must use ProtectorAssets), --enable-res-protect,
+            // --detect-proxy, --pin-certs <file>.
             EncryptAssets = false,
             EnableResProtect = false,
             DetectProxy = false,
-            PinCertsFile = string.IsNullOrWhiteSpace(PinCertsBox.Text) ? null : PinCertsBox.Text.Trim(),
+            PinCertsFile = null,
             Channel = string.IsNullOrWhiteSpace(ChannelBox.Text) ? null : ChannelBox.Text.Trim(),
             HollowPrefixes = HollowPrefixBox.Text,
             VmpPrefixes = Vmp1PrefixBox.Text,

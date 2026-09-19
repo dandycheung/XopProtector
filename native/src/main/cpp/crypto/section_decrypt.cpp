@@ -5,6 +5,9 @@
 #include "common/runtime_state.h"
 #include "crypto/aes.h"
 #include "crypto/rc4.h"
+#include "crypto/sha256.h"
+#include "crypto/apk_sign.h"
+#include "crypto/key_ladder.h"
 #include "hook/hooks.h"
 #include "risk/risk.h"
 #include "risk/so_guard.h"
@@ -21,16 +24,25 @@
 #include <elf.h>
 #include <sys/mman.h>
 
-// Must be unmangled so packer can find them via dynamic symbol table.
-extern "C" {
-KEEP_SYMBOL PROTECTOR_DATA_SECTION uint8_t PROTECTOR_UNKNOWN_DATA[16] = {0};
-KEEP_SYMBOL PROTECTOR_DATA_SECTION uint8_t PROTECTOR_INSN_KEY[16] = {0};
-KEEP_SYMBOL PROTECTOR_DATA_SECTION uint8_t PROTECTOR_DEX_KEY[16] = {0};
-KEEP_SYMBOL PROTECTOR_DATA_SECTION uint8_t PROTECTOR_ASSETS_KEY[16] = {0};
-KEEP_SYMBOL PROTECTOR_DATA_SECTION uint8_t PROTECTOR_HMAC_KEY[32] = {0};
-}
-
 namespace protector {
+
+namespace {
+
+struct __attribute__((packed)) XopWrapSlot {
+    uint8_t magic[16];
+    uint8_t wrapped[16];
+};
+
+/* K_wrap lives outside .bitcode (needed to RC4-decrypt it). Hidden, no
+ * PROTECTOR_* identifier. Packer finds the section by name and the magic. */
+__attribute__((section(SECTION_NAME_PROTWRAP), used, visibility("hidden"), aligned(1)))
+static volatile XopWrapSlot g_xop_wrap = {
+        {0x58, 0x4f, 0x50, 0x4b, 0x57, 0x52, 0x41, 0x50, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0}
+};
+
+} // namespace
+
 
 static int page_mprotect(void* start, void* end, int prot) {
     uintptr_t start_addr = PROTECTOR_PAGE_START(reinterpret_cast<uintptr_t>(start));
@@ -42,6 +54,31 @@ static int page_mprotect(void* start, void* end, int prot) {
         return -1;
     }
     return 0;
+}
+
+/**
+ * Bootstrap pad for K_wrap. Must live outside .bitcode because it is needed
+ * to RC4-decrypt .bitcode itself. Split so a single 16-byte literal is not
+ * sitting next to the wrap slot.
+ */
+static bool recover_k_wrap(uint8_t out[16]) {
+    // clang-format off
+    const uint8_t a[8] = {0x3b, 0x7c, 0x19, 0x5e, 0xa2, 0xdf, 0x48, 0x31};
+    const uint8_t b[8] = {0x6c, 0x85, 0xea, 0x27, 0x54, 0x9b, 0x0f, 0xd6};
+    // clang-format on
+    bool any = false;
+    for (int i = 0; i < 8; i++) {
+        out[i] = static_cast<uint8_t>(g_xop_wrap.wrapped[i]) ^ a[i];
+        out[i + 8] = static_cast<uint8_t>(g_xop_wrap.wrapped[i + 8]) ^ b[i];
+        any = any || (out[i] != 0) || (out[i + 8] != 0);
+    }
+    return any;
+}
+
+static void wipe_k_wrap_slot() {
+    auto* slot = const_cast<uint8_t*>(g_xop_wrap.wrapped);
+    (void)page_mprotect(slot, slot + 16, PROT_READ | PROT_WRITE);
+    memset(slot, 0, 16);
 }
 
 static void decrypt_section(const char* section_name, int temp_prot, int target_prot) {
@@ -91,12 +128,20 @@ static void decrypt_section(const char* section_name, int temp_prot, int target_
     if (!bitcode) {
         abort();
     }
+    uint8_t wrap[16];
+    if (!recover_k_wrap(wrap)) {
+        PLOGE("K_wrap slot empty");
+        abort();
+    }
     struct rc4_state dec_state {};
-    rc4_init(&dec_state, PROTECTOR_UNKNOWN_DATA, 16);
+    rc4_init(&dec_state, wrap, 16);
     rc4_crypt(&dec_state, target, bitcode, static_cast<int>(shdr.sh_size));
     memcpy(target, bitcode, shdr.sh_size);
+    memset(wrap, 0, sizeof(wrap));
+    memset(&dec_state, 0, sizeof(dec_state));
     memset(bitcode, 0, shdr.sh_size);
     free(bitcode);
+    wipe_k_wrap_slot();
     __builtin___clear_cache(reinterpret_cast<char*>(target),
                             reinterpret_cast<char*>(target + shdr.sh_size));
 
@@ -110,26 +155,6 @@ void decrypt_bitcode() {
     decrypt_section(SECTION_NAME_BITCODE,
                     PROT_READ | PROT_WRITE | PROT_EXEC,
                     PROT_READ | PROT_EXEC);
-}
-
-/**
- * Bootstrap pad for PROTECTOR_UNKNOWN_DATA. Must live outside .bitcode because
- * it is needed to RC4-decrypt .bitcode itself. Split + XOR so a single
- * 16-byte literal is not sitting next to the symbol in .data.
- */
-static void unpad_unknown_key() {
-    // clang-format off
-    const uint8_t a[8] = {0x3b, 0x7c, 0x19, 0x5e, 0xa2, 0xdf, 0x48, 0x31};
-    const uint8_t b[8] = {0x6c, 0x85, 0xea, 0x27, 0x54, 0x9b, 0x0f, 0xd6};
-    // clang-format on
-    for (int i = 0; i < 8; i++) {
-        PROTECTOR_UNKNOWN_DATA[i] ^= a[i];
-        PROTECTOR_UNKNOWN_DATA[i + 8] ^= b[i];
-    }
-}
-
-static void wipe_unknown_key() {
-    memset(PROTECTOR_UNKNOWN_DATA, 0, 16);
 }
 
 static void seed_rng() {
@@ -151,16 +176,25 @@ static void seed_rng() {
 
 void init_protector() {
     seed_rng();
-    unpad_unknown_key();
 #ifdef DECRYPT_BITCODE
     decrypt_bitcode();
 #endif
-    // RC4 key no longer needed after .bitcode is plaintext in memory.
-    wipe_unknown_key();
     protector::risk::so_guard_init();
 #ifndef NDEBUG
     if (!crypto::aes_self_test()) {
         __android_log_print(ANDROID_LOG_ERROR, "protector", "AES self-test failed");
+        abort();
+    }
+    if (!crypto::hkdf_self_test()) {
+        __android_log_print(ANDROID_LOG_ERROR, "protector", "HKDF self-test failed");
+        abort();
+    }
+    if (!crypto::apk_sign_self_test()) {
+        __android_log_print(ANDROID_LOG_ERROR, "protector", "APK v2/v3 cert parse self-test failed");
+        abort();
+    }
+    if (!crypto::key_ladder_self_test()) {
+        __android_log_print(ANDROID_LOG_ERROR, "protector", "key ladder self-test failed");
         abort();
     }
 #endif

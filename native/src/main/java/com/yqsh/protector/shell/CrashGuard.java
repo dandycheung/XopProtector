@@ -7,6 +7,10 @@ import androidx.annotation.Keep;
 /**
  * Phase 5 — chain {@link Thread.UncaughtExceptionHandler} without replacing the
  * app's handler. Reports a soft threat then delegates.
+ * <p>
+ * Uses an explicit nested class (not a lambda): the shell DEX is re-d8'd from the
+ * R8 jar in {@code exportShellFiles}, and lambda synthetics have been observed to
+ * throw {@link NoSuchMethodError} at runtime ({@code shell/a.<init>(Handler)}).
  */
 @Keep
 public final class CrashGuard {
@@ -21,19 +25,8 @@ public final class CrashGuard {
             return;
         }
         installed = true;
-        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
-        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
-            try {
-                String name = e != null ? e.getClass().getSimpleName() : "Throwable";
-                JniBridge.reportThreat("uncaught_" + sanitize(name));
-            } catch (Throwable ignored) {
-            }
-            if (prev != null) {
-                prev.uncaughtException(t, e);
-            } else {
-                Log.e(TAG, "uncaught", e);
-            }
-        });
+        Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler(new ChainedHandler(prev));
     }
 
     private static String sanitize(String s) {
@@ -51,5 +44,29 @@ public final class CrashGuard {
             }
         }
         return sb.toString();
+    }
+
+    /** Explicit handler — avoids R8/d8 lambda re-desugar breakage in shell DEX. */
+    @Keep
+    private static final class ChainedHandler implements Thread.UncaughtExceptionHandler {
+        private final Thread.UncaughtExceptionHandler prev;
+
+        ChainedHandler(Thread.UncaughtExceptionHandler prev) {
+            this.prev = prev;
+        }
+
+        @Override
+        public void uncaughtException(Thread t, Throwable e) {
+            try {
+                String name = e != null ? e.getClass().getSimpleName() : "Throwable";
+                JniBridge.reportThreat("uncaught_" + sanitize(name));
+            } catch (Throwable ignored) {
+            }
+            if (prev != null) {
+                prev.uncaughtException(t, e);
+            } else {
+                Log.e(TAG, "uncaught", e);
+            }
+        }
     }
 }

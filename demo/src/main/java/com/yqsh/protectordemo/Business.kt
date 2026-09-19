@@ -117,6 +117,25 @@ object Business {
         return f.toInt()
     }
 
+    /** PR10: packed-switch (Dalvik 0x2b) coverage for True-VMP. */
+    @JvmStatic
+    fun packedSwitchProbe(x: Int): Int {
+        return when (x) {
+            0 -> 10
+            1 -> 20
+            2 -> 30
+            3 -> 40
+            else -> -1
+        }
+    }
+
+    /** fill-array-data (Dalvik 0x26) coverage for True-VMP. */
+    @JvmStatic
+    fun fillArrayProbe(i: Int): Int {
+        val a = intArrayOf(10, 20, 30, 40)
+        return a[i and 3]
+    }
+
     /** JNI into libdemo_biz.so (Phase 4 --protect-so smoke). */
     @JvmStatic
     external fun nativeAddRaw(a: Int, b: Int): Int

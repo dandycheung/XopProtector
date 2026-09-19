@@ -5,105 +5,68 @@ import com.yqsh.protector.packer.util.CryptoUtils;
 
 import java.io.File;
 import java.io.RandomAccessFile;
+import java.util.Arrays;
 import java.util.List;
 
 /**
- * Encrypts .bitcode in libprotector.so with RC4 (size-preserving) and writes
- * AES keys into PROTECTOR_UNKNOWN_DATA / PROTECTOR_INSN_KEY / PROTECTOR_DEX_KEY
- * (XOR-padded). Method bodies use AES-GCM; dexes.zip uses PDX1+AES-GCM.
+ * RC4-encrypts {@code .bitcode} with {@code K_wrap} and writes XOR-padded
+ * {@code K_master} into the {@code XOPKMASTER} slot before encrypt.
+ * {@code K_wrap} is written into the {@code .protwrap} section by magic,
+ * not via a dynamic symbol.
  */
 public final class SoSectionEncryptor {
-    // Must match SECTION_NAME_BITCODE in protector_macro.h
     private static final String BITCODE = ".bitcode";
-    private static final String KEY_SYMBOL = "PROTECTOR_UNKNOWN_DATA";
-    private static final String INSN_KEY_SYMBOL = "PROTECTOR_INSN_KEY";
-    private static final String DEX_KEY_SYMBOL = "PROTECTOR_DEX_KEY";
-    private static final String HMAC_KEY_SYMBOL = "PROTECTOR_HMAC_KEY";
-    private static final String ASSETS_KEY_SYMBOL = "PROTECTOR_ASSETS_KEY";
-
-    // XOR pads — must match C++ kKeyPadUnknown / kKeyPadInsn / KEY_PAD_DEX / KEY_PAD_HMAC / KEY_PAD_ASSETS.
-    private static final byte[] KEY_PAD_UNKNOWN = {
-        (byte)0x3b, 0x7c, 0x19, 0x5e, (byte)0xa2, (byte)0xdf, 0x48, 0x31,
-        0x6c, (byte)0x85, (byte)0xea, 0x27, 0x54, (byte)0x9b, 0x0f, (byte)0xd6
-    };
-    private static final byte[] KEY_PAD_INSN = {
-        (byte)0xc7, 0x2a, 0x5f, (byte)0x98, 0x1d, 0x63, (byte)0xae, 0x34,
-        (byte)0xf8, 0x41, 0x0b, 0x76, (byte)0xd9, 0x52, (byte)0x8c, (byte)0xe3
-    };
-    /** Must match load_dex_key_from_so pad in engine.cpp. */
-    public static final byte[] KEY_PAD_DEX = {
-        (byte)0xa1, 0x5c, 0x2e, 0x79, 0x04, (byte)0xb8, 0x6d, 0x3f,
-        (byte)0xc2, 0x17, (byte)0x8a, 0x50, (byte)0xe6, 0x3b, (byte)0x91, 0x4d
-    };
-    /** Must match load_hmac_key pad in engine.cpp. */
-    public static final byte[] KEY_PAD_HMAC = {
-        0x5a, (byte)0xe1, 0x2c, (byte)0x97, 0x44, (byte)0xb8, 0x0f, 0x6d,
-        (byte)0x83, 0x1a, (byte)0xf5, 0x60, 0x2e, (byte)0xc9, 0x47, (byte)0xd3,
-        0x19, 0x7b, (byte)0xa4, 0x58, (byte)0xe6, 0x0d, (byte)0x92, 0x3f,
-        (byte)0xc1, 0x56, (byte)0x8a, 0x24, (byte)0xf0, 0x6b, 0x35, (byte)0xde
-    };
-    /** Must match load_assets_key_from_so pad in engine.cpp. */
-    public static final byte[] KEY_PAD_ASSETS = {
-        0x4e, (byte)0xb3, 0x17, (byte)0x8c, 0x2a, 0x61, (byte)0xd5, 0x09,
-        (byte)0xf0, 0x3c, (byte)0x7a, (byte)0xa8, 0x15, (byte)0xce, 0x56, (byte)0x92
-    };
+    private static final long SHF_WRITE = 0x1L;
+    private static final long SHF_ALLOC = 0x2L;
 
     private SoSectionEncryptor() {
     }
 
-    /** XOR key with pad so raw ELF symbol doesn't expose plaintext key. */
-    private static byte[] xorBytes(byte[] a, byte[] b) {
-        byte[] r = new byte[a.length];
-        for (int i = 0; i < a.length; i++) r[i] = (byte)(a[i] ^ b[i]);
-        return r;
-    }
-
-    public static void encrypt(File soFile, byte[] soAesKey, byte[] insnAesKey) throws Exception {
-        encrypt(soFile, soAesKey, insnAesKey, null, null, null);
-    }
-
-    public static void encrypt(File soFile, byte[] soAesKey, byte[] insnAesKey, byte[] dexAesKey)
+    /**
+     * Embed the same {@code K_master} (and {@code K_wrap}) into one ABI's
+     * {@code libprotector.so}. All ABIs must receive identical master bytes.
+     *
+     * @return lowercase hex HMAC-SHA256 of the post-wipe plaintext {@code .bitcode}
+     *         (K_master slot zeroed), matching runtime after {@code recover_k_master}.
+     */
+    public static String encrypt(File soFile, byte[] kWrap, byte[] kMaster, byte[] kHmac)
             throws Exception {
-        encrypt(soFile, soAesKey, insnAesKey, dexAesKey, null, null);
+        if (soFile == null || !soFile.isFile() || kWrap == null || kWrap.length != KeyLadder.WRAP_LEN) {
+            throw new IllegalArgumentException("invalid so or K_wrap");
+        }
+        if (kMaster == null || kMaster.length != KeyLadder.MASTER_LEN) {
+            throw new IllegalArgumentException("invalid K_master");
+        }
+        if (kHmac == null || kHmac.length != KeyLadder.HMAC_LEN) {
+            throw new IllegalArgumentException("invalid K_hmac");
+        }
+        String hmacHex = encryptBitcodeWithMaster(soFile, kWrap, KeyLadder.wrapMaster(kMaster), kHmac);
+        writeWrapSlot(soFile, KeyLadder.wrapWrapKey(kWrap));
+        return hmacHex;
     }
 
-    public static void encrypt(File soFile, byte[] soAesKey, byte[] insnAesKey, byte[] dexAesKey,
-                               byte[] hmacKey) throws Exception {
-        encrypt(soFile, soAesKey, insnAesKey, dexAesKey, hmacKey, null);
-    }
-
-    public static void encrypt(File soFile, byte[] soAesKey, byte[] insnAesKey, byte[] dexAesKey,
-                               byte[] hmacKey, byte[] assetsAesKey) throws Exception {
-        if (soFile == null || !soFile.isFile() || soAesKey == null || soAesKey.length != 16) {
-            throw new IllegalArgumentException("invalid so or SO AES key");
+    /**
+     * HMAC-SHA256 of decrypted {@code .bitcode} as the process sees it after
+     * wiping the K_master slot (magic remains, 32-byte payload is zeros).
+     */
+    static String hmacBitcodePostWipe(byte[] plainWithMaster, byte[] kHmac) {
+        if (plainWithMaster == null || kHmac == null || kHmac.length != KeyLadder.HMAC_LEN) {
+            throw new IllegalArgumentException("bitcode HMAC requires plaintext and K_hmac");
         }
-        if (insnAesKey == null || insnAesKey.length != 16) {
-            throw new IllegalArgumentException("invalid insn AES key");
-        }
-        encryptBitcode(soFile, soAesKey);
-        writeKeySymbol(soFile, KEY_SYMBOL, xorBytes(soAesKey, KEY_PAD_UNKNOWN));
-        writeKeySymbol(soFile, INSN_KEY_SYMBOL, xorBytes(insnAesKey, KEY_PAD_INSN));
-        if (dexAesKey != null) {
-            if (dexAesKey.length != 16) {
-                throw new IllegalArgumentException("invalid dex AES key");
-            }
-            writeKeySymbol(soFile, DEX_KEY_SYMBOL, xorBytes(dexAesKey, KEY_PAD_DEX));
-        }
-        if (hmacKey != null) {
-            if (hmacKey.length != 32) {
-                throw new IllegalArgumentException("invalid HMAC key");
-            }
-            writeKeySymbol(soFile, HMAC_KEY_SYMBOL, xorBytes(hmacKey, KEY_PAD_HMAC));
-        }
-        if (assetsAesKey != null) {
-            if (assetsAesKey.length != 16) {
-                throw new IllegalArgumentException("invalid assets AES key");
-            }
-            writeKeySymbol(soFile, ASSETS_KEY_SYMBOL, xorBytes(assetsAesKey, KEY_PAD_ASSETS));
+        int magicAt = findUniqueMagic(plainWithMaster);
+        byte[] forMac = Arrays.copyOf(plainWithMaster, plainWithMaster.length);
+        int slot = magicAt + KeyLadder.MASTER_MAGIC.length;
+        Arrays.fill(forMac, slot, slot + KeyLadder.MASTER_LEN, (byte) 0);
+        try {
+            return CryptoUtils.toHex(CryptoUtils.hmacSha256(kHmac, forMac));
+        } finally {
+            Arrays.fill(forMac, (byte) 0);
         }
     }
 
-    private static void encryptBitcode(File soFile, byte[] aesKey) throws Exception {
+    private static String encryptBitcodeWithMaster(File soFile, byte[] kWrap, byte[] wrappedMaster,
+                                                   byte[] kHmac)
+            throws Exception {
         try (ReadElf readElf = new ReadElf(soFile)) {
             List<ReadElf.SectionHeader> headers = readElf.getSectionHeaders();
             for (ReadElf.SectionHeader sh : headers) {
@@ -114,35 +77,78 @@ public final class SoSectionEncryptor {
                     throw new IllegalStateException("empty .bitcode in " + soFile.getName());
                 }
                 byte[] plain = readAt(soFile, offset, size);
-                byte[] enc = CryptoUtils.rc4Crypt(aesKey, plain);
-                if (enc == null || enc.length != plain.length) {
+                int magicAt = findUniqueMagic(plain);
+                System.arraycopy(wrappedMaster, 0, plain, magicAt + KeyLadder.MASTER_MAGIC.length,
+                        wrappedMaster.length);
+                String hmacHex = hmacBitcodePostWipe(plain, kHmac);
+                byte[] enc = CryptoUtils.rc4Crypt(kWrap, plain);
+                Arrays.fill(plain, (byte) 0);
+                if (enc == null || enc.length != size) {
                     throw new IllegalStateException("RC4 encrypt .bitcode failed");
                 }
                 writeAt(soFile, offset, enc);
-                System.out.println("Encrypted .bitcode (RC4) in " + soFile.getName()
+                System.out.println("Encrypted .bitcode (RC4) + K_master slot in " + soFile.getName()
                         + " offset=0x" + Long.toHexString(offset) + " size=" + size);
-                return;
+                return hmacHex;
             }
         }
         throw new IllegalStateException("no .bitcode section in " + soFile.getName());
     }
 
-    private static void writeKeySymbol(File soFile, String symbolName, byte[] key) throws Exception {
+    static int findUniqueMagic(byte[] haystack) {
+        return findUniqueMagic(haystack, KeyLadder.MASTER_MAGIC, KeyLadder.MASTER_LEN, "XOPKMASTER");
+    }
+
+    static int findUniqueMagic(byte[] haystack, byte[] magic, int payloadLen, String label) {
+        if (haystack == null || magic == null || label == null) {
+            throw new IllegalArgumentException("magic search requires haystack, magic, label");
+        }
+        int found = -1;
+        int count = 0;
+        int need = magic.length + payloadLen;
+        for (int i = 0; i + need <= haystack.length; i++) {
+            boolean match = true;
+            for (int j = 0; j < magic.length; j++) {
+                if (haystack[i + j] != magic[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                count++;
+                found = i;
+            }
+        }
+        if (count != 1) {
+            throw new IllegalStateException(
+                    "expected one " + label + " slot, found " + count);
+        }
+        return found;
+    }
+
+    private static void writeWrapSlot(File soFile, byte[] wrappedKey) throws Exception {
+        if (wrappedKey == null || wrappedKey.length != KeyLadder.WRAP_LEN) {
+            throw new IllegalArgumentException("invalid wrapped K_wrap");
+        }
         try (ReadElf readElf = new ReadElf(soFile)) {
-            ReadElf.Symbol symbol = readElf.getDynamicSymbol(symbolName);
-            if (symbol == null) {
-                throw new IllegalStateException("symbol " + symbolName + " not found in " + soFile.getName());
+            ReadElf.SectionHeader sh = readElf.getSectionHeader(KeyLadder.PROTWRAP_SECTION);
+            if (sh == null) {
+                throw new IllegalStateException("no .protwrap section in " + soFile.getName());
             }
-            int shndx = symbol.shndx;
-            List<ReadElf.SectionHeader> headers = readElf.getSectionHeaders();
-            if (shndx < 0 || shndx >= headers.size()) {
-                throw new IllegalStateException("bad shndx for " + symbolName);
+            if ((sh.getFlags() & SHF_ALLOC) == 0 || (sh.getFlags() & SHF_WRITE) == 0) {
+                throw new IllegalStateException(".protwrap is not ALLOC|WRITE in " + soFile.getName());
             }
-            ReadElf.SectionHeader sectionHeader = headers.get(shndx);
-            long symbolDataOffset = sectionHeader.getOffset() + symbol.value - sectionHeader.getAddr();
-            writeAt(soFile, symbolDataOffset, key);
-            System.out.println("Wrote " + symbolName + " at 0x" + Long.toHexString(symbolDataOffset)
-                    + " in " + soFile.getName());
+            int size = (int) sh.getSize();
+            int need = KeyLadder.WRAP_MAGIC.length + KeyLadder.WRAP_LEN;
+            if (size < need) {
+                throw new IllegalStateException(".protwrap too small in " + soFile.getName());
+            }
+            byte[] plain = readAt(soFile, sh.getOffset(), size);
+            int magicAt = findUniqueMagic(plain, KeyLadder.WRAP_MAGIC, KeyLadder.WRAP_LEN, "XOPKWRAP");
+            System.arraycopy(wrappedKey, 0, plain, magicAt + KeyLadder.WRAP_MAGIC.length, wrappedKey.length);
+            writeAt(soFile, sh.getOffset(), plain);
+            System.out.println("Wrote K_wrap slot in " + soFile.getName()
+                    + " .protwrap offset=0x" + Long.toHexString(sh.getOffset()));
         }
     }
 

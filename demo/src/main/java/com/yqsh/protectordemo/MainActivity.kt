@@ -1,16 +1,24 @@
 package com.yqsh.protectordemo
 
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
+    private lateinit var tv: TextView
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val tv = TextView(this)
-        tv.textSize = 16f
+        tv = TextView(this)
+        tv.textSize = 14f
         tv.setPadding(48, 48, 48, 48)
+        setContentView(tv)
+
+        LifecycleProbe.installActivity(this, application)
+
         val packed = isProtectorPacked()
         try {
             // Shell must re-pin Application so getApplication() is DemoApplication, not Proxy.
@@ -40,16 +48,17 @@ class MainActivity : AppCompatActivity() {
             val sync = Business.syncProbe(20)
             val lsh = Business.longShiftProbe(8L, 2)
             val fcast = Business.floatCastProbe(Float.NaN)
+            val psw = Business.packedSwitchProbe(2)
+            val pswDef = Business.packedSwitchProbe(99)
+            val fill = Business.fillArrayProbe(1)
 
-            // Assets encrypt / NetGuard / channel probes are disabled for now
-            // (packer/desktop keep --encrypt-assets / --detect-proxy / --enable-res-protect off).
+            // Assets / res-protect / NetGuard / pin-certs: off in protectDemo + desktop.
+            // CLI only; --encrypt-assets needs ProtectorAssets (not AssetManager.open).
 
             var expectScore = (7 + 11) * 3
             if (expectScore < 0) expectScore *= -1
-            // R8 may fold array-length to +2 for IntArray(2)
             val expectArr = 10 + 3 + 2
-            // (8<<2) | (8>>>2) = 32 | 2 = 34
-            val ok = secret == "protector-ok-42"
+            val bizOk = secret == "protector-ok-42"
                     && sum == 42
                     && score == expectScore
                     && inv == 42
@@ -64,20 +73,43 @@ class MainActivity : AppCompatActivity() {
                     && sync == 82
                     && lsh == 34L
                     && fcast == 0
+                    && psw == 30
+                    && pswDef == -1
+                    && fill == 20
             val status = when {
                 !packed -> getString(R.string.status_unpacked)
-                ok -> getString(R.string.status_pass)
+                bizOk -> getString(R.string.status_pass)
                 else -> getString(R.string.status_fail)
             }
-            val msg = "secret=$secret add=$sum score=$score inv=$inv field=$field arr=$arr " +
+            val bizMsg = "secret=$secret add=$sum score=$score inv=$inv field=$field arr=$arr " +
                     "catch=$caught/$okPath so=$so f=$f d=$d fcmp=$fcmp sync=$sync lsh=$lsh fcast=$fcast " +
+                    "psw=$psw/$pswDef fill=$fill " +
                     "status=$status"
-            tv.text = msg.replace(' ', '\n')
-            Log.i("protector-demo", msg)
+            tv.tag = bizMsg.replace(' ', '\n')
+            refreshUi("pending")
+            Log.i("protector-demo", bizMsg)
         } catch (t: Throwable) {
-            tv.text = getString(R.string.status_error, t.message ?: "")
+            tv.tag = getString(R.string.status_error, t.message ?: "")
+            refreshUi("error")
             Log.e("protector-demo", "business failed", t)
         }
-        setContentView(tv)
+
+        // ProcessLifecycleOwner dispatches ON_START/ON_RESUME after first frame.
+        Handler(Looper.getMainLooper()).post {
+            refreshUi("post")
+            Handler(Looper.getMainLooper()).postDelayed({ refreshUi("delayed") }, 500)
+        }
+    }
+
+    private fun refreshUi(phase: String) {
+        val biz = (tv.tag as? String).orEmpty()
+        val life = LifecycleProbe.statusLine()
+        val lifeStatus = when {
+            LifecycleProbe.overallOk() -> getString(R.string.lifecycle_pass)
+            LifecycleProbe.processOnlyBroken() -> getString(R.string.lifecycle_partial)
+            else -> getString(R.string.lifecycle_fail)
+        }
+        tv.text = "$biz\n\n--- lifecycle ($phase) ---\n$lifeStatus\n$life"
+        Log.i("protector.Lifecycle", "ui[$phase] $lifeStatus ${LifecycleProbe.statusLine().replace('\n', ' ')}")
     }
 }
